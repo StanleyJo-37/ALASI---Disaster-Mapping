@@ -6,5 +6,5 @@ output/depth_vis
 
 __pycache__
 
-data
+ai/data/
 results/
