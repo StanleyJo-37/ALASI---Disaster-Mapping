@@ -1,0 +1,16 @@
+path: E:/dev/Pre-Thesis/vision-ai-development/data/RescueNet/yolo-baseline
+train: train/train-org-img
+val: val/val-org-img
+
+names:
+  1: background
+  2: water
+  3: building_no_damage
+  4: building_minor_damage
+  5: building_major_damage
+  6: building_total_destruction
+  7: road_clear
+  8: road_blocked
+  9: vehicle
+  10: tree
+  11: pool

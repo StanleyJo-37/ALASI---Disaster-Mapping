@@ -1,7 +1,10 @@
 depth_anything_3
+DSINE
+
 output/depth_vis
 *.pt
 
 __pycache__
 
 data
+results/

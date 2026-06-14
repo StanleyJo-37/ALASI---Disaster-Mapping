@@ -1,3 +1,4 @@
+from typing import Tuple
 import albumentations as A
 import cv2
 
@@ -5,20 +6,21 @@ import numpy as np
 
 error = (1/3) * np.sum(np.square(np.array([0, -1, -2])))
 
-def get_augmentation_pipeline(
-  height: float=640.0,
-  width: float=640.0
-) -> A.Compose:
-  return A.Compose([
+def get_augmentation_pipeline() -> Tuple[A.Compose, A.Compose]:
+  spatial = A.ReplayCompose([
     A.VerticalFlip(p=0.5),
     A.HorizontalFlip(p=0.5),
     A.RandomRotate90(p=0.5),
     A.Affine(
-      scale=(0, 0.15),
+      scale=(0.85, 1.15),
       interpolation=cv2.INTER_LINEAR,
       mask_interpolation=cv2.INTER_NEAREST,
       p=0.5
     ),
+    A.ToTensorV2()
+  ], additional_targets={'depth': 'image', 'normals': 'image'})
+  
+  photometric = A.Compose([
     A.OneOf([
       A.MotionBlur(p=0.5),
       A.GaussNoise(),
@@ -34,10 +36,7 @@ def get_augmentation_pipeline(
       fill_mask=0,
       p=0.2
     ),
-    A.Resize(
-      height=height,
-      width=width,
-      interpolation=cv2.INTER_CUBIC,
-      mask_interpolation=cv2.INTER_NEAREST
-    ),
+    A.ToTensorV2()
   ])
+  
+  return spatial, photometric
