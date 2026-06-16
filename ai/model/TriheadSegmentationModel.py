@@ -1,4 +1,5 @@
-from typing_extensions import Optional, List, Tuple
+from typing import Optional, List, Tuple
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -22,6 +23,8 @@ class TriheadSegmentationModel(torch.nn.Module):
     self,
     yolo_pt_path: str,
     device: str,
+    include_depth: bool = True,
+    include_normals: bool = True,
     verbose: bool = False,
     extrinsics: Optional[np.ndarray] = None,
     intrinsics: Optional[np.ndarray] = None,
@@ -34,25 +37,31 @@ class TriheadSegmentationModel(torch.nn.Module):
     self.verbose = verbose
     self.extrinsics = extrinsics
     self.intrinsics = intrinsics
+    self.include_depth = include_depth
+    self.include_normals = include_normals
     
     self.yolo = YOLO(model=yolo_pt_path, task='segment', verbose=verbose).to(device)
     self.yolo.model.to(device)
     
-    def intercept_feature_map(_module, _input, output):
-      self.intercepted_features = output.to(device=device)
-    self.yolo.model.model[22].register_forward_hook(intercept_feature_map)
+    if self.include_depth and self.include_normals:
+      def intercept_feature_map(_module, _input, output):
+        self.intercepted_features = output.to(device=device)
+      self.yolo.model.model[22].register_forward_hook(intercept_feature_map)
     
-    self.depth_head = torch.nn.Sequential(
-      torch.nn.Conv2d(in_channels=self.feature_size, out_channels=256, kernel_size=3, padding=1),
-      torch.nn.ReLU(),
-      torch.nn.Conv2d(256, 1, kernel_size=1),
-    ).to(device)
-    self.normal_head = torch.nn.Sequential(
-      torch.nn.Conv2d(in_channels=self.feature_size, out_channels=256, kernel_size=3, padding=1),
-      torch.nn.ReLU(),
-      torch.nn.Conv2d(256, 3, kernel_size=1),
-      torch.nn.Tanh(),
-    ).to(device)
+    if self.include_depth:
+      self.depth_head = torch.nn.Sequential(
+        torch.nn.Conv2d(in_channels=self.feature_size, out_channels=256, kernel_size=3, padding=1),
+        torch.nn.ReLU(),
+        torch.nn.Conv2d(256, 1, kernel_size=1),
+      ).to(device)
+    
+    if self.include_normals:
+      self.normal_head = torch.nn.Sequential(
+        torch.nn.Conv2d(in_channels=self.feature_size, out_channels=256, kernel_size=3, padding=1),
+        torch.nn.ReLU(),
+        torch.nn.Conv2d(256, 3, kernel_size=1),
+        torch.nn.Tanh(),
+      ).to(device)
   
   def stitch_maps(self, maps_list: List[np.ndarray]) -> np.ndarray:
     return np.array([])
@@ -65,10 +74,16 @@ class TriheadSegmentationModel(torch.nn.Module):
     
     f_map = self.intercepted_features
     
-    depth_out = self.depth_head(f_map.to(device=self.device))
-    normal_out = self.normal_head(f_map.to(device=self.device))
+    if self.include_depth:
+      depth_out = self.depth_head(f_map.to(device=self.device))
+      depth_out = F.interpolate(depth_out, size=self.target_size, mode='bilinear')
+    else:
+      depth_out = None
     
-    depth_out = F.interpolate(depth_out, size=self.target_size, mode='bilinear')
-    normal_out = F.interpolate(normal_out, size=self.target_size, mode='bilinear')
+    if self.include_normals:
+      normal_out = self.normal_head(f_map.to(device=self.device))
+      normal_out = F.interpolate(normal_out, size=self.target_size, mode='bilinear')
+    else:
+      normal_out = None
     
     return segmentation_map, depth_out, normal_out

@@ -1,4 +1,5 @@
-from typing_extensions import Optional
+from typing import Optional
+
 from pydantic import BaseModel, ConfigDict
 import numpy as np
 

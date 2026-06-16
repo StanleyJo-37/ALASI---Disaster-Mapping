@@ -1,7 +1,7 @@
 from typing import Tuple
+
 import albumentations as A
 import cv2
-
 import numpy as np
 
 error = (1/3) * np.sum(np.square(np.array([0, -1, -2])))

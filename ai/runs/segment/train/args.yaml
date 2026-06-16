@@ -9,7 +9,7 @@ batch: 16
 imgsz: 640
 save: true
 save_period: -1
-cache: false
+cache: false 
 device: null
 workers: 8
 project: null

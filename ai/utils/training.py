@@ -1,5 +1,6 @@
-import torch
 from math import inf
+
+import torch
 
 def compute_normal_loss(pred_norm: torch.Tensor, gt_norm: torch.Tensor):
   """ compute per-pixel surface normal error in degrees

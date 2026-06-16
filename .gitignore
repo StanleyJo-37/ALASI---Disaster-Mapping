@@ -7,4 +7,6 @@ output/depth_vis
 __pycache__
 
 ai/data/
-results/
+ai/results/
+ai/runs/
+ai/output/
