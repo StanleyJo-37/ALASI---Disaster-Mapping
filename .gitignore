@@ -10,3 +10,5 @@ ai/data/
 ai/results/
 ai/runs/
 ai/output/
+
+.env
