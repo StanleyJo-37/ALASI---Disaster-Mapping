@@ -51,3 +51,15 @@ class EarlyStoppingAndCheckpointing():
         return True
     
     return False
+  
+  def save_weights(self, save_path: str) -> None:
+    return save_path
+  
+  def is_checkpoint(self) -> bool:
+    return not (self.epoch % self.save_per_epoch)
+  
+  def __delete__(self, instance):
+    del self.best_parameters
+    
+    for parameter in self.saved_parameters:
+      del parameter

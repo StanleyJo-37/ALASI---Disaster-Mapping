@@ -5,12 +5,12 @@ import torch
 from torch.utils.data import Dataset
 from skimage import io
 import numpy as np
-import cv2
 
 from utils.labels import convert_png_to_yolo_label, create_binary_mask
 
 def collate_fn(batch):
   images, targets = zip(*batch)
+  include_depth, include_normals = targets[0]['include_depth'], targets[0]['include_normals']
   
   batch_images = torch.stack(images, dim=0)
   _, h, w = batch_images.shape[1:]
@@ -25,8 +25,8 @@ def collate_fn(batch):
     batch_bboxes.extend(seg_annotations['bboxes'])
     batch_masks.extend([create_binary_mask(coords, (h, w)) for coords in seg_annotations['masks']])
     
-    batch_depth.append(target['depth_map'])
-    batch_normals.append(target['surface_normals'])
+    batch_depth.append(target['depth_map'] if include_depth else [])
+    batch_normals.append(target['surface_normals'] if include_normals else [])
     
     batch_indices.extend(torch.full((len(seg_annotations['class_ids']),), i))
     
@@ -39,10 +39,10 @@ def collate_fn(batch):
     },
     {
       'depth': torch.stack([d.squeeze() for d in batch_depth], dim=0).unsqueeze(1),
-    },
+    } if include_depth else None,
     {
       'normals': torch.stack([n.squeeze() for n in batch_normals], dim=0)
-    }
+    } if include_normals else None
   )
 
 class RescueNetDataset(Dataset):
@@ -141,12 +141,12 @@ class RescueNetDataset(Dataset):
       'seg_annotations': label_annotations
     }
     
+    target['include_depth'] = self.include_depth
     if self.include_depth:
       target['depth_map'] = depth_tensor
     
+    target['include_normals'] = self.include_normals
     if self.include_normals:
       target['surface_normals'] = aug_normals
     
     return aug_rgb, target
-
-  

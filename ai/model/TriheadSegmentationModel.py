@@ -43,7 +43,7 @@ class TriheadSegmentationModel(torch.nn.Module):
     self.yolo = YOLO(model=yolo_pt_path, task='segment', verbose=verbose).to(device)
     self.yolo.model.to(device)
     
-    if self.include_depth and self.include_normals:
+    if self.include_depth or self.include_normals:
       def intercept_feature_map(_module, _input, output):
         self.intercepted_features = output.to(device=device)
       self.yolo.model.model[22].register_forward_hook(intercept_feature_map)
@@ -72,16 +72,14 @@ class TriheadSegmentationModel(torch.nn.Module):
   def forward(self, X: torch.Tensor, *args, **kwds):
     segmentation_map = self.yolo.model(X)
     
-    f_map = self.intercepted_features
-    
     if self.include_depth:
-      depth_out = self.depth_head(f_map.to(device=self.device))
+      depth_out = self.depth_head(self.intercepted_features)
       depth_out = F.interpolate(depth_out, size=self.target_size, mode='bilinear')
     else:
       depth_out = None
     
     if self.include_normals:
-      normal_out = self.normal_head(f_map.to(device=self.device))
+      normal_out = self.normal_head(self.intercepted_features)
       normal_out = F.interpolate(normal_out, size=self.target_size, mode='bilinear')
     else:
       normal_out = None
