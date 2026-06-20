@@ -1,4 +1,6 @@
 from math import inf
+from typing import Dict, Any
+import os
 
 import torch
 
@@ -52,8 +54,21 @@ class EarlyStoppingAndCheckpointing():
     
     return False
   
-  def save_weights(self, save_path: str) -> None:
-    return save_path
+  def save_weights(self, save_dir: str, model_prefix: str, last_state_dict: Dict[str, Any]) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    
+    best_path = os.path.join(save_dir, f"{model_prefix}_best.pth")
+    torch.save(self.best_parameters, best_path)
+    print(f"Saved best weights to {best_path}")
+    
+    last_path = os.path.join(save_dir, f"{model_prefix}_last.pth")
+    torch.save(last_state_dict, last_path)
+    print(f"Saved last weights to {last_path}")
+    
+    for i, parameter in enumerate(self.saved_parameters):
+      ckpt_path = os.path.join(save_dir, f'{model_prefix}_ckpt_{i + 1}.pth')
+      torch.save(ckpt_path, parameter)
+    print(f"Saved weight checkpoints.")
   
   def is_checkpoint(self) -> bool:
     return not (self.epoch % self.save_per_epoch)

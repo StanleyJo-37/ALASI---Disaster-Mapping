@@ -49,6 +49,7 @@ class RescueNetDataset(Dataset):
   def __init__(
     self,
     data_dir: str,
+    training: bool = False,
     include_depth: bool = True,
     include_normals: bool = True,
     spatial_transform=None,
@@ -58,6 +59,7 @@ class RescueNetDataset(Dataset):
     
     self.include_depth = include_depth
     self.include_normals = include_normals
+    self.training = training
     
     self.spatial_transform = spatial_transform
     self.photometric_transform = photometric_transform
@@ -81,6 +83,10 @@ class RescueNetDataset(Dataset):
     return len(self.ids)
     
   def __getitem__(self, index):
+    target = {}
+    target['include_depth'] = self.include_depth
+    target['include_normals'] = self.include_normals
+    
     image_path = self.image_paths[index]
     label_path = self.label_paths[index]
     depth_path = self.depth_paths[index] if self.include_depth else None
@@ -90,14 +96,32 @@ class RescueNetDataset(Dataset):
     
     label = np.load(label_path).squeeze()
     
+    depth = None
     if self.include_depth:
       depth = np.load(depth_path).squeeze()
       depth = depth.astype(np.float32)
 
+    normals = None
     if self.include_normals:
       normals = np.load(normals_path).squeeze()
       normals = np.transpose(normals, [1, 2, 0])
       normals = normals.astype(np.float32)
+    
+    if not self.training:
+      target['seg_annotations'] = convert_png_to_yolo_label(label)
+      
+      if self.include_depth:
+        target['depth_map'] = torch.from_numpy(depth)
+      
+      if self.include_normals:
+        normals_tensor = torch.from_numpy(normals).permute(2, 0, 1).float()
+        target['surface_normals'] = normals_tensor
+      
+      val_image = torch.from_numpy(image).permute(2, 0, 1).float()
+      if val_image.max() > 1.0:
+          val_image /= 255.0
+          
+      return val_image, target
     
     aug_rgb = image.copy()
     if self.spatial_transform:
@@ -137,15 +161,11 @@ class RescueNetDataset(Dataset):
     
     depth_tensor = aug_depth.unsqueeze(0).float() if self.include_depth else None
     
-    target = {
-      'seg_annotations': label_annotations
-    }
+    target['seg_annotations'] = label_annotations
     
-    target['include_depth'] = self.include_depth
     if self.include_depth:
       target['depth_map'] = depth_tensor
     
-    target['include_normals'] = self.include_normals
     if self.include_normals:
       target['surface_normals'] = aug_normals
     
