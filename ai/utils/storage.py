@@ -5,7 +5,7 @@ from pathlib import Path
  
 def upload_folder_to_huggingface(local_folder_path: str, path_in_repo: str = ""):
     token = os.environ.get("HF_TOKEN")
-    repo_id = os.environ.get("HF_REPO_ID")
+    repo_id = os.environ.get("HF_MODEL_REPO_ID")
  
     for file_path in Path(local_folder_path).rglob("*"):
         if file_path.is_file():

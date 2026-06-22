@@ -12,3 +12,6 @@ ai/runs/
 ai/output/
 
 .env
+
+**/*.pth
+**/*.csv
