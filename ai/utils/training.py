@@ -9,7 +9,10 @@ def compute_normal_loss(pred_norm: torch.Tensor, gt_norm: torch.Tensor):
     NOTE: pred_norm and gt_norm should be torch tensors of shape (B, 3, ...)
   """
   pred_error = torch.cosine_similarity(pred_norm, gt_norm, dim=1)
-  pred_error = torch.clamp(pred_error, min=-1.0, max=1.0)
+  
+  eps = 1e-6
+  pred_error = torch.clamp(pred_error, min=-1.0 + eps, max=1.0 - eps)
+  
   pred_error = torch.acos(pred_error) * 180.0 / torch.pi
   return pred_error.mean()
 
@@ -47,15 +50,18 @@ class EarlyStoppingAndCheckpointing():
     else:
       improved = new_evaluation_score > (self.best_evaluation_score + self.delta)
     
+    cpu_parameters = {k: v.cpu().clone() for k, v in parameters.items()}
+    cpu_loss_balancer = {k: v.cpu().clone() for k, v in loss_balancer_parameters.items()}
+    
     if self.epoch % self.save_per_epoch == 0:
-      self.saved_parameters.append(parameters)
-      self.saved_loss_balancer_parameters.append(loss_balancer_parameters)
+      self.saved_parameters.append(cpu_parameters)
+      self.saved_loss_balancer_parameters.append(cpu_loss_balancer)
     
     if improved:
       self.best_evaluation_score = new_evaluation_score
       self.epoch_since_last_improvement = 0
-      self.best_parameters = parameters
-      self.best_loss_balancer_parameters = loss_balancer_parameters
+      self.best_parameters = cpu_parameters
+      self.best_loss_balancer_parameters = cpu_loss_balancer
     else:
       self.epoch_since_last_improvement += 1
       
@@ -80,24 +86,26 @@ class EarlyStoppingAndCheckpointing():
     torch.save(self.best_parameters, best_path)
     print(f"Saved best weights to {best_path}")
     
-    best_path = os.path.join(save_dir, f"weights/loss-balancer/{model_prefix}_best.pth")
-    torch.save(self.best_loss_balancer_parameters, best_path)
-    print(f"Saved best loss balancer weights to {best_path}")
+    best_balancer_path = os.path.join(save_dir, f"weights/loss-balancer/{model_prefix}_best.pth")
+    torch.save(self.best_loss_balancer_parameters, best_balancer_path)
+    print(f"Saved best loss balancer weights to {best_balancer_path}")
     
     last_path = os.path.join(save_dir, f"weights/model/{model_prefix}_last.pth")
     torch.save(last_state_dict, last_path)
     print(f"Saved last weights to {last_path}")
     
-    best_path = os.path.join(save_dir, f"weights/loss-balancer/{model_prefix}_last.pth")
-    torch.save(last_loss_balancer_state_dict, best_path)
-    print(f"Saved last loss balancer weights to {best_path}")
+    last_balancer_path = os.path.join(save_dir, f"weights/loss-balancer/{model_prefix}_last.pth")
+    torch.save(last_loss_balancer_state_dict, last_balancer_path)
+    print(f"Saved last loss balancer weights to {last_balancer_path}")
     
     for i, (parameter, loss_balancer_parameters) in enumerate(zip(self.saved_parameters, self.saved_loss_balancer_parameters)):
-      ckpt_path = os.path.join(save_dir, f'weights/model/{model_prefix}_ckpt_{i + 1}.pth')
+      epoch = (i + 1) * self.save_per_epoch
+      
+      ckpt_path = os.path.join(save_dir, f'weights/model/{model_prefix}_ckpt_{epoch}.pth')
       torch.save(parameter, ckpt_path)
       
-      ckpt_path = os.path.join(save_dir, f'weights/loss-balancer/{model_prefix}_ckpt_{i + 1}.pth')
-      torch.save(loss_balancer_parameters, ckpt_path)
+      ckpt_path_bal = os.path.join(save_dir, f'weights/loss-balancer/{model_prefix}_ckpt_{epoch}.pth')
+      torch.save(loss_balancer_parameters, ckpt_path_bal)
     print(f"Saved weight checkpoints.")
   
   def is_checkpoint(self) -> bool:

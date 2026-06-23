@@ -59,8 +59,8 @@ def create_peft_model(model: TriheadSegmentationModel):
         valid_target_modules.append(name)
 
   lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
+    r=32,
+    lora_alpha=64,
     target_modules=valid_target_modules,
     modules_to_save=["model.23.*"],
     bias="none",
@@ -209,7 +209,8 @@ for model_type in [
       epoch_train_normal_loss = 0.0
       epoch_weighted_train_normal_loss = 0.0
 
-      with autocast(device_type=device_name, dtype=torch.float16):
+      final_model.train()
+      with autocast(device_type=device_name, dtype=torch.bfloat16):
         for batch_idx, (batch_images, batch_targets) in enumerate(train_loader, 1):
           optimizer.zero_grad()
 
@@ -250,8 +251,8 @@ for model_type in [
 
       avg_train_loss = epoch_train_loss / len(train_loader)
       avg_train_seg_loss = epoch_train_seg_loss / len(train_loader)
-      avg_weighted_train_seg_loss = epoch_weighted_train_depth_loss / len(train_loader)
-      avg_train_depth_loss = epoch_train_seg_loss / len(train_loader)
+      avg_weighted_train_seg_loss = epoch_weighted_train_seg_loss / len(train_loader)
+      avg_train_depth_loss = epoch_train_depth_loss / len(train_loader)
       avg_weighted_train_depth_loss = epoch_weighted_train_depth_loss / len(train_loader)
       avg_train_normal_loss = epoch_train_normal_loss / len(train_loader)
       avg_weighted_train_normal_loss = epoch_weighted_train_normal_loss / len(train_loader)
@@ -264,9 +265,10 @@ for model_type in [
       epoch_val_normal_loss = 0.0
       epoch_weighted_val_normal_loss = 0.0
 
+      final_model.eval()
       with torch.no_grad():
         for batch_images_val, batch_targets_val in val_loader:
-          segmentation_out, depth_out, normal_out = final_model(batch_images.to(device=device))
+          segmentation_out, depth_out, normal_out = final_model(batch_images_val.to(device=device))
 
           true_segmentation_map = batch_targets_val[0]
           true_depth_map = batch_targets_val[1]['depth'].to(device=device) if include_depth else None
@@ -327,13 +329,13 @@ for model_type in [
         f"LR: {optimizer.param_groups[0]['lr']:.2e}\n",
         f"============================================\n"
         f"---TRAINING---\n"
-        f"- Total Loss: {epoch_train_loss:.4f}\n"
-        f"- Seg: {epoch_train_seg_loss:.4f}\n"
-        f"- Depth: {epoch_train_depth_loss:.4f}\n"
-        f"- Norm: {epoch_train_normal_loss:.4f}\n"
+        f"- Total Loss: {avg_train_loss:.4f}\n"
+        f"- Seg: {avg_train_seg_loss:.4f}\n"
+        f"- Depth: {avg_train_depth_loss:.4f}\n"
+        f"- Norm: {avg_train_normal_loss:.4f}\n"
         f"============================================\n"
         f"---VALIDATION---\n"
-        f"- Total Loss: {epoch_val_loss:.4f}\n"
+        f"- Total Loss: {avg_val_loss:.4f}\n"
         f"- Seg: {avg_val_seg_loss:.4f}\n"
         f"- Depth: {avg_val_depth_loss:.4f}\n"
         f"- Norm: {avg_val_normal_loss:.4f}\n"
@@ -344,12 +346,45 @@ for model_type in [
 
     early_stopping.save_weights('./', model_type, final_model.state_dict(), loss_balancer.state_dict())
 
+    os.makedirs('eval_results', exist_ok=True)
     csv_filename = f"eval_results/{model_type}_loss_history.csv"
     with open(csv_filename, mode='w', newline='') as file:
       writer = csv.writer(file)
-      writer.writerow(['epoch', 'train_loss', 'val_loss'])
+      writer.writerow([
+        'epoch',
+        'train_loss',
+        'train_seg_loss',
+        'train_weighted_seg_loss',
+        'train_depth_loss',
+        'train_weighted_depth_loss',
+        'train_normal_loss',
+        'train_weighted_normal_loss',
+        'val_loss',
+        'val_seg_loss',
+        'val_weighted_seg_loss',
+        'val_depth_loss',
+        'val_weighted_depth_loss',
+        'val_normal_loss',
+        'val_weighted_normal_loss',
+      ])
       for i in range(len(epoch_history)):
-        writer.writerow([epoch_history[i], train_loss_history[i], val_loss_history[i]])
+        writer.writerow([
+          epoch_history[i], 
+          train_loss_history[i]['loss'],
+          train_loss_history[i]['seg_loss'],
+          train_loss_history[i]['weighted_seg_loss'],
+          train_loss_history[i]['depth_loss'],
+          train_loss_history[i]['weighted_depth_loss'],
+          train_loss_history[i]['normal_loss'],
+          train_loss_history[i]['weighted_normal_loss'],
+          val_loss_history[i]['loss'],
+          val_loss_history[i]['seg_loss'],
+          val_loss_history[i]['weighted_seg_loss'],
+          val_loss_history[i]['depth_loss'],
+          val_loss_history[i]['weighted_depth_loss'],
+          val_loss_history[i]['normal_loss'],
+          val_loss_history[i]['weighted_normal_loss'],
+        ])
     print(f"Saved training history to {csv_filename}")
 
     upload_folder_to_huggingface(
@@ -360,6 +395,9 @@ for model_type in [
       'eval_results',
       'eval_results'
     )
+    
+    # Cleanup
+    del final_model, loss_balancer, optimizer, scaler, train_loader, val_loader, dataset_and_loader
 
     unreachable_object = gc.collect()
 
@@ -371,7 +409,7 @@ for model_type in [
       torch.cuda.ipc_collect()
 
       alloc_after = torch.cuda.memory_allocated() / (1024 ** 3)
-      res_after = torch.cuda.memory_reserved() / (2014 ** 3)
+      res_after = torch.cuda.memory_reserved() / (1024 ** 3)
 
       print(f"VRAM Allocated: {alloc_before:.2f} GB  ->  {alloc_after:.2f} GB")
       print(f"VRAM Reserved:  {res_before:.2f} GB  ->  {res_after:.2f} GB")
