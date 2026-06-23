@@ -156,8 +156,8 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     include_normals=include_normals
   )
 
-  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn)
-  val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
+  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=collate_fn)
+  val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=64, shuffle=False, collate_fn=collate_fn)
   
   return {
     'train': (train_dataset, train_loader),
