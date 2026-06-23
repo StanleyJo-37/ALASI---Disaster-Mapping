@@ -1,6 +1,4 @@
 # --- Core Architecture & PEFT ---
-torch==2.5.1+cu121
-torchvision==0.20.1+cu121
 ultralytics==8.4.70
 peft==0.19.1
 accelerate==1.13.0
@@ -29,7 +27,6 @@ geffnet==1.0.2
 # --- Data Pipeline ---
 numpy==2.4.4
 opencv-contrib-python==4.13.0.92
-scikit-image==0.26.0
 albumentationsx==2.2.2
 runpod==1.9.1
 
@@ -43,6 +40,5 @@ omegaconf==2.3.0
 
 # --- Utilities & Visualization ---
 addict==2.4.0
-accelerate==1.13.0
 uv==0.11.23
 pydantic==2.13.3
