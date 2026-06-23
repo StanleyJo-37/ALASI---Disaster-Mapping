@@ -15,6 +15,8 @@ if AI_DIR not in sys.path:
 lib_path = os.path.abspath(os.path.join(ROOT_PATH, 'lib'))
 if lib_path not in sys.path:
   sys.path.append(lib_path)
+
+print('Importing Dependencies..')
 from types import SimpleNamespace
 import gc
 import csv
@@ -37,12 +39,14 @@ from custom_types.training import AblationStudyType
 from utils.runpod import terminate_session
 from utils.storage import upload_folder_to_huggingface
 
+print('Loading variables..')
 load_dotenv()
 MODEL_WEIGHT_DIR = 'model/weights'
 device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_name)
 print(device)
 
+print('Downloading dataset..')
 os.makedirs('./data', exist_ok=True)
 snapshot_download(
   repo_id=os.environ.get('HF_DATASET_REPO_ID'),
@@ -51,6 +55,7 @@ snapshot_download(
   token=os.environ.get('HF_TOKEN')
 )
 
+print('Defining functions..')
 def create_peft_model(model: TriheadSegmentationModel):
   valid_target_modules = []
   for name, module in model.yolo.model.named_modules():
@@ -171,6 +176,7 @@ def get_depth_and_normals_inclusion(model_type: AblationStudyType) -> tuple[bool
 
 TOTAL_EPOCHS = 300
 
+print('Start training - ablation study')
 for model_type in [
     'vanilla',
     'additional-depth',
