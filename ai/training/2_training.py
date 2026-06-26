@@ -28,7 +28,7 @@ from ultralytics.utils.loss import SemanticSegmentationLoss
 from ultralytics.optim import MuSGD
 from torch.optim import AdamW
 from torch.nn import L1Loss
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast
 # from huggingface_hub import snapshot_download
 
 from datasets.rescuenet_dataset import RescueNetDataset, collate_fn
@@ -202,7 +202,6 @@ for model_type in [
       lr=5e-4,
       weight_decay=5e-4
     )
-    scaler = GradScaler('cuda')
 
     seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
     depth_loss_criterion = L1Loss()
@@ -266,9 +265,8 @@ for model_type in [
             # Sum only the active, weighted components
             loss_total = sum(loss_components)
 
-          scaler.scale(loss_total).backward()
-          scaler.step(optimizer)
-          scaler.update()
+          loss_total.backward()
+          optimizer.step()
 
           epoch_train_loss += loss_total.item()
           epoch_train_seg_loss += seg_loss.mean().item()
@@ -433,7 +431,7 @@ for model_type in [
     )
     
     # Cleanup
-    del final_model, loss_balancer, optimizer, scaler, train_loader, val_loader, dataset_and_loader
+    del final_model, loss_balancer, optimizer, train_loader, val_loader, dataset_and_loader
 
     unreachable_object = gc.collect()
 

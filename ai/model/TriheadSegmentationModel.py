@@ -2,14 +2,13 @@ from typing import Optional, List, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from ultralytics import YOLO
 
-from .FeatureDecoderHead import DecoderHead
+from .DecoderHead import DecoderHead
 from .DisasterSiteMap import DisasterSiteMap
 
 class TriheadSegmentationModel(torch.nn.Module):
-  intercepted_features: Optional[List[torch.Tensor]] = [None] * 3
+  intercepted_features: Optional[List[torch.Tensor]]
   extrinsics: Optional[np.ndarray] = None
   intrinsics: Optional[np.ndarray] = None
   images: List[np.ndarray] = []
@@ -30,6 +29,7 @@ class TriheadSegmentationModel(torch.nn.Module):
   ):
     super(TriheadSegmentationModel, self).__init__()
     
+    self.intercepted_features = [None] * 3
     self.feature_size = 256
     self.yolo_pt_path = yolo_pt_path
     self.device = device
