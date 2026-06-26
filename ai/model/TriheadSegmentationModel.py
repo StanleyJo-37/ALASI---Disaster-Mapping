@@ -9,7 +9,7 @@ from .FeatureDecoderHead import DecoderHead
 from .DisasterSiteMap import DisasterSiteMap
 
 class TriheadSegmentationModel(torch.nn.Module):
-  intercepted_features: Optional[torch.Tensor] = None
+  intercepted_features: Optional[List[torch.Tensor]] = [None] * 3
   extrinsics: Optional[np.ndarray] = None
   intrinsics: Optional[np.ndarray] = None
   images: List[np.ndarray] = []
@@ -39,28 +39,26 @@ class TriheadSegmentationModel(torch.nn.Module):
     self.include_depth = include_depth
     self.include_normals = include_normals
     
-    # 1. Instantiate the wrapper locally (not saved to self)
     yolo_wrapper = YOLO(model=yolo_pt_path, verbose=verbose)
     
-    # 2. Extract the pure PyTorch backbone and save it
     self.yolo_backbone = yolo_wrapper.model.to(device)
     
     if self.include_depth or self.include_normals:
-      def intercept_feature_map(_module, _input, output):
+      def intercept_feature_map(_module, _input, output, store_idx):
         if isinstance(output, tuple) or isinstance(output, list):
-            self.intercepted_features = output[-1].to(device=device) 
+          self.intercepted_features[store_idx] = output[-1].to(device=device) 
         else:
-            self.intercepted_features = output.to(device=device)
+          self.intercepted_features[store_idx] = output.to(device=device)
 
-      target_layer_idx = len(self.yolo_backbone.model) - 2
-      self.yolo_backbone.model[target_layer_idx].register_forward_hook(intercept_feature_map)
+      for i, module_idx in enumerate([4, 6, 10]):
+        self.yolo_backbone.model[module_idx].register_forward_hook(lambda _module, _input, output, idx=i: intercept_feature_map(_module, _input, output, idx))
     
     if self.include_depth:
-      self.depth_head = DecoderHead(1).to(device)
+      self.depth_head = DecoderHead(out_channels=1, target_size=self.target_size).to(device)
     
     if self.include_normals:
       self.normal_head = torch.nn.Sequential(
-        DecoderHead(3),
+        DecoderHead(out_channels=3, target_size=self.target_size),
         torch.nn.Tanh()
       ).to(device)
   
@@ -73,16 +71,12 @@ class TriheadSegmentationModel(torch.nn.Module):
   def forward(self, X: torch.Tensor, *args, **kwds):
     segmentation_map = self.yolo_backbone._predict_once(X)
     
-    if self.include_depth:
-      depth_out = self.depth_head(self.intercepted_features)
-      depth_out = F.interpolate(depth_out, size=self.target_size, mode='bilinear')
-    else:
-      depth_out = None
+    depth_out = normal_out = None
     
+    p5, p4, p3 = self.intercepted_features[2], self.intercepted_features[1], self.intercepted_features[0]
+    if self.include_depth:
+      depth_out = self.depth_head(p5, p4, p3)
     if self.include_normals:
-      normal_out = self.normal_head(self.intercepted_features)
-      normal_out = F.interpolate(normal_out, size=self.target_size, mode='bilinear')
-    else:
-      normal_out = None
+      normal_out = self.normal_head(p5, p4, p3)
     
     return segmentation_map, depth_out, normal_out

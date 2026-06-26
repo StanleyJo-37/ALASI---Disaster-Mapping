@@ -43,6 +43,8 @@ from utils.storage import upload_folder_to_huggingface
 print('Loading variables..')
 load_dotenv()
 MODEL_WEIGHT_DIR = 'model/weights'
+TRAIN_BATCH_SIZE = 16
+VAL_BATCH_SIZE = 16
 device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_name)
 print(device)
@@ -73,7 +75,6 @@ def create_peft_model(model: TriheadSegmentationModel):
     r=16,
     lora_alpha=32,
     target_modules=valid_target_modules,
-    modules_to_save=[r"model\.23\..*"],
     bias="none",
   )
   peft_backbone = get_peft_model(model.yolo_backbone, peft_config=lora_config).to(device)
@@ -162,8 +163,8 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     include_normals=include_normals
   )
 
-  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn)
-  val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
+  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+  val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
   
   return {
     'train': (train_dataset, train_loader),
@@ -196,37 +197,11 @@ for model_type in [
     trainable_params = [p for p in final_model.parameters() if p.requires_grad]
     trainable_params.extend(loss_balancer.parameters())
 
-    muon_parameters = []
-    sdg_parameters = []
-    for p in trainable_params:
-      if p.requires_grad:
-        if p.ndim >= 2:
-          muon_parameters.append(p)
-        else:
-          sdg_parameters.append(p)
-
-    # param_groups = [
-    #   {"params": muon_parameters, "use_muon": True},
-    #   {"params": sdg_parameters, "use_muon": False}
-    # ]
-    model_params = [p for p in final_model.parameters() if p.requires_grad]
-    balancer_params = [p for p in loss_balancer.parameters() if p.requires_grad]
-    param_groups = [
-      {"params": model_params, 'lr': 5e-4},
-      {"params": balancer_params, 'lr': 1e-6}
-    ]
-
     optimizer = AdamW(
-      param_groups,
+      trainable_params,
       lr=5e-4,
       weight_decay=5e-4
     )
-    # optimizer = MuSGD(
-    #   param_groups,
-    #   lr=1e-4,
-    #   momentum=0.937,
-    #   weight_decay=5e-4
-    # )
     scaler = GradScaler('cuda')
 
     seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
@@ -262,6 +237,7 @@ for model_type in [
           true_surface_normals = batch_targets[2]['normals'].to(device=device) if include_normals else None
 
           seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
+          seg_loss /= TRAIN_BATCH_SIZE
           depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
           normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
 
@@ -334,6 +310,7 @@ for model_type in [
           true_surface_normals = batch_targets_val[2]['normals'].to(device=device) if include_normals else None
 
           seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
+          seg_loss /= VAL_BATCH_SIZE
           depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
           normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
 
