@@ -6,36 +6,23 @@ from torch.utils.data import Dataset
 from skimage import io
 import numpy as np
 
-from utils.labels import convert_png_to_yolo_label, create_binary_mask
-
 def collate_fn(batch):
   images, targets = zip(*batch)
   include_depth, include_normals = targets[0]['include_depth'], targets[0]['include_normals']
   
   batch_images = torch.stack(images, dim=0)
-  _, h, w = batch_images.shape[1:]
   
-  batch_cls, batch_indices, batch_masks, batch_bboxes = [], [], [], []
   batch_depth, batch_normals = [], []
+  batch_sem_masks = []
   
   for i, target in enumerate(targets):
-    seg_annotations = target['seg_annotations']
-    
-    batch_cls.extend(seg_annotations['class_ids'])
-    batch_bboxes.extend(seg_annotations['bboxes'])
-    batch_masks.extend([create_binary_mask(coords, (h, w)) for coords in seg_annotations['masks']])
-    
+    batch_sem_masks.append(target['semantic_mask'])
     batch_depth.append(target['depth_map'] if include_depth else [])
     batch_normals.append(target['surface_normals'] if include_normals else [])
     
-    batch_indices.extend(torch.full((len(seg_annotations['class_ids']),), i))
-    
   return batch_images, (
     {
-      'cls': torch.tensor(batch_cls, dtype=torch.float32).unsqueeze(1),
-      'bboxes': torch.tensor(batch_bboxes, dtype=torch.float32),
-      'batch_idx': torch.tensor(batch_indices, dtype=torch.int64),
-      'masks': torch.stack(batch_masks, dim=0) if len(batch_masks) > 0 else torch.zeros((0, h, w), dtype=torch.float32)
+      'semantic_mask': torch.stack(batch_sem_masks, dim=0),
     },
     {
       'depth': torch.stack([d.squeeze() for d in batch_depth], dim=0).unsqueeze(1),
@@ -108,7 +95,7 @@ class RescueNetDataset(Dataset):
       normals = normals.astype(np.float32)
     
     if not self.training:
-      target['seg_annotations'] = convert_png_to_yolo_label(label)
+      target['semantic_mask'] = torch.from_numpy(label).long()
       
       if self.include_depth:
         target['depth_map'] = torch.from_numpy(depth)
@@ -123,7 +110,9 @@ class RescueNetDataset(Dataset):
           
       return val_image, target
     
-    aug_rgb = image.copy()
+    aug_mask = label
+    aug_depth = depth
+    aug_normals = normals
     if self.spatial_transform:
       augmented = self.spatial_transform(
         image=image,
@@ -157,11 +146,9 @@ class RescueNetDataset(Dataset):
       aug_rgb /= 255.0
 
     label_tensor = aug_mask.long()
-    label_annotations = convert_png_to_yolo_label(label_tensor)
+    target['semantic_mask'] = label_tensor
     
     depth_tensor = aug_depth.unsqueeze(0).float() if self.include_depth else None
-    
-    target['seg_annotations'] = label_annotations
     
     if self.include_depth:
       target['depth_map'] = depth_tensor

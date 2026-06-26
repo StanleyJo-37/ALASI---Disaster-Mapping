@@ -5,11 +5,10 @@ import torch
 import torch.nn.functional as F
 from ultralytics import YOLO
 
+from .FeatureDecoderHead import DecoderHead
 from .DisasterSiteMap import DisasterSiteMap
 
 class TriheadSegmentationModel(torch.nn.Module):
-  yolo_pt_path: str
-  yolo: YOLO
   intercepted_features: Optional[torch.Tensor] = None
   extrinsics: Optional[np.ndarray] = None
   intrinsics: Optional[np.ndarray] = None
@@ -31,7 +30,7 @@ class TriheadSegmentationModel(torch.nn.Module):
   ):
     super(TriheadSegmentationModel, self).__init__()
     
-    self.feature_size = 512
+    self.feature_size = 256
     self.yolo_pt_path = yolo_pt_path
     self.device = device
     self.verbose = verbose
@@ -40,27 +39,29 @@ class TriheadSegmentationModel(torch.nn.Module):
     self.include_depth = include_depth
     self.include_normals = include_normals
     
-    self.yolo = YOLO(model=yolo_pt_path, task='segment', verbose=verbose).to(device)
-    self.yolo.model.to(device)
+    # 1. Instantiate the wrapper locally (not saved to self)
+    yolo_wrapper = YOLO(model=yolo_pt_path, verbose=verbose)
+    
+    # 2. Extract the pure PyTorch backbone and save it
+    self.yolo_backbone = yolo_wrapper.model.to(device)
     
     if self.include_depth or self.include_normals:
       def intercept_feature_map(_module, _input, output):
-        self.intercepted_features = output.to(device=device)
-      self.yolo.model.model[22].register_forward_hook(intercept_feature_map)
+        if isinstance(output, tuple) or isinstance(output, list):
+            self.intercepted_features = output[-1].to(device=device) 
+        else:
+            self.intercepted_features = output.to(device=device)
+
+      target_layer_idx = len(self.yolo_backbone.model) - 2
+      self.yolo_backbone.model[target_layer_idx].register_forward_hook(intercept_feature_map)
     
     if self.include_depth:
-      self.depth_head = torch.nn.Sequential(
-        torch.nn.Conv2d(in_channels=self.feature_size, out_channels=256, kernel_size=3, padding=1),
-        torch.nn.ReLU(),
-        torch.nn.Conv2d(256, 1, kernel_size=1),
-      ).to(device)
+      self.depth_head = DecoderHead(1).to(device)
     
     if self.include_normals:
       self.normal_head = torch.nn.Sequential(
-        torch.nn.Conv2d(in_channels=self.feature_size, out_channels=256, kernel_size=3, padding=1),
-        torch.nn.ReLU(),
-        torch.nn.Conv2d(256, 3, kernel_size=1),
-        torch.nn.Tanh(),
+        DecoderHead(3),
+        torch.nn.Tanh()
       ).to(device)
   
   def stitch_maps(self, maps_list: List[np.ndarray]) -> np.ndarray:
@@ -70,7 +71,7 @@ class TriheadSegmentationModel(torch.nn.Module):
     return np.array([])
   
   def forward(self, X: torch.Tensor, *args, **kwds):
-    segmentation_map = self.yolo.model(X)
+    segmentation_map = self.yolo_backbone._predict_once(X)
     
     if self.include_depth:
       depth_out = self.depth_head(self.intercepted_features)

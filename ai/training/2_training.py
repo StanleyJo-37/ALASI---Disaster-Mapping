@@ -24,11 +24,12 @@ from dotenv import load_dotenv
 
 import torch
 from peft import LoraConfig, get_peft_model
-from ultralytics.utils.loss import v8SegmentationLoss, E2ELoss
+from ultralytics.utils.loss import SemanticSegmentationLoss
+from ultralytics.optim import MuSGD
 from torch.optim import AdamW
 from torch.nn import L1Loss
 from torch.amp import autocast, GradScaler
-from huggingface_hub import snapshot_download
+# from huggingface_hub import snapshot_download
 
 from datasets.rescuenet_dataset import RescueNetDataset, collate_fn
 from utils.augmentations import get_augmentation_pipeline
@@ -36,7 +37,7 @@ from model.TriheadSegmentationModel import TriheadSegmentationModel
 from model.UncertaintyLossWeighting import UncertaintyLossWeighting
 from utils.training import compute_normal_loss, EarlyStoppingAndCheckpointing
 from custom_types.training import AblationStudyType
-from utils.runpod import terminate_session
+# from utils.runpod import terminate_session
 from utils.storage import upload_folder_to_huggingface
 
 print('Loading variables..')
@@ -47,85 +48,88 @@ device = torch.device(device_name)
 print(device)
 
 print('Downloading dataset..')
-os.makedirs('./data', exist_ok=True)
-snapshot_download(
-  repo_id=os.environ.get('HF_DATASET_REPO_ID'),
-  repo_type="dataset",
-  local_dir="./data",
-  token=os.environ.get('HF_TOKEN')
-)
+# os.makedirs('./data', exist_ok=True)
+# snapshot_download(
+#   repo_id=os.environ.get('HF_DATASET_REPO_ID'),
+#   repo_type="dataset",
+#   local_dir="./data",
+#   token=os.environ.get('HF_TOKEN')
+# )
 
 print('Defining functions..')
+def set_training_mode(model: torch.nn.Module, mode: bool = True):
+  for m in model.modules():
+      m.training = mode
+  return model
+
 def create_peft_model(model: TriheadSegmentationModel):
   valid_target_modules = []
-  for name, module in model.yolo.model.named_modules():
+  for name, module in model.yolo_backbone.named_modules():
     if isinstance(module, torch.nn.Conv2d):
       if module.groups == 1:
         valid_target_modules.append(name)
 
   lora_config = LoraConfig(
-    r=32,
-    lora_alpha=64,
+    r=16,
+    lora_alpha=32,
     target_modules=valid_target_modules,
-    modules_to_save=["model.23.*"],
+    modules_to_save=[r"model\.23\..*"],
     bias="none",
   )
-  peft_backbone = get_peft_model(model.yolo.model, peft_config=lora_config).to(device)
+  peft_backbone = get_peft_model(model.yolo_backbone, peft_config=lora_config).to(device)
   peft_backbone.print_trainable_parameters()
   peft_backbone.to(device)
 
-  model.yolo.model = peft_backbone
+  model.yolo_backbone = peft_backbone
   final_model = model.to(device)
 
   return final_model
 
 def infuse_args(model: TriheadSegmentationModel):
-  current_args = model.yolo.model.args if isinstance(model.yolo.model.args, dict) else {}
+  current_args = model.yolo_backbone.args if isinstance(model.yolo_backbone.args, dict) else {}
 
   if 'overlap_mask' not in current_args:
     current_args['overlap_mask'] = True
+  current_args['nc'] = 11
 
-  current_args['box'] = 7.5
-  current_args['cls'] = 0.5
-  current_args['dfl'] = 1.5
-
-  model.yolo.model.args = SimpleNamespace(**current_args)
+  model.yolo_backbone.args = SimpleNamespace(**current_args)
 
 def get_model(model_type: AblationStudyType):
   if model_type == 'vanilla':
     model = TriheadSegmentationModel(
-      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-seg.pt',
+      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt',
       include_depth=False,
       include_normals=False,
       device=device
     )
   elif model_type == 'additional-depth':
     model = TriheadSegmentationModel(
-      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-seg.pt',
+      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt',
       include_depth=True,
       include_normals=False,
       device=device
     )
   elif model_type == 'additional-normal':
     model = TriheadSegmentationModel(
-      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-seg.pt',
+      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt',
       include_depth=False,
       include_normals=True,
       device=device
     )
   elif model_type == 'additional-both':
     model = TriheadSegmentationModel(
-      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-seg.pt',
+      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt',
       include_depth=True,
       include_normals=True,
       device=device
     )
 
   infuse_args(model)
+  raw_yolo_architecture = model.yolo_backbone
   final_model = create_peft_model(model)
   loss_balancer = UncertaintyLossWeighting()
 
-  return final_model, loss_balancer
+  return raw_yolo_architecture, final_model, loss_balancer
 
 spatial_aug, photometric_aug = get_augmentation_pipeline()
 
@@ -150,14 +154,16 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     photometric_transform=photometric_aug,
     training=True
   )
+  from torch.utils.data.dataset import Subset
+  train_dataset = Subset(train_dataset, list(range(256)))
   val_dataset = RescueNetDataset(
     data_dir='./data/RescueNet/val',
     include_depth=include_depth,
     include_normals=include_normals
   )
 
-  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=True, collate_fn=collate_fn)
-  val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=64, shuffle=False, collate_fn=collate_fn)
+  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True, collate_fn=collate_fn)
+  val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=16, shuffle=False, collate_fn=collate_fn)
   
   return {
     'train': (train_dataset, train_loader),
@@ -174,27 +180,56 @@ def get_depth_and_normals_inclusion(model_type: AblationStudyType) -> tuple[bool
   elif model_type == 'additional-both':
     return True, True
 
-TOTAL_EPOCHS = 300
+TOTAL_EPOCHS = 5
 
 print('Start training - ablation study')
 for model_type in [
-    'vanilla',
-    'additional-depth',
-    'additional-normal',
+    # 'vanilla',
+    # 'additional-depth',
+    # 'additional-normal',
     'additional-both'
   ]:
-    final_model, loss_balancer = get_model(model_type)
+    raw_yolo_architecture, final_model, loss_balancer = get_model(model_type)
     dataset_and_loader = get_dataset_and_loader(model_type)
     include_depth, include_normals = get_depth_and_normals_inclusion(model_type)
 
     trainable_params = [p for p in final_model.parameters() if p.requires_grad]
     trainable_params.extend(loss_balancer.parameters())
 
-    optimizer = AdamW(trainable_params, lr=1e-4, weight_decay=1e-4)
+    muon_parameters = []
+    sdg_parameters = []
+    for p in trainable_params:
+      if p.requires_grad:
+        if p.ndim >= 2:
+          muon_parameters.append(p)
+        else:
+          sdg_parameters.append(p)
+
+    # param_groups = [
+    #   {"params": muon_parameters, "use_muon": True},
+    #   {"params": sdg_parameters, "use_muon": False}
+    # ]
+    model_params = [p for p in final_model.parameters() if p.requires_grad]
+    balancer_params = [p for p in loss_balancer.parameters() if p.requires_grad]
+    param_groups = [
+      {"params": model_params, 'lr': 5e-4},
+      {"params": balancer_params, 'lr': 1e-6}
+    ]
+
+    optimizer = AdamW(
+      param_groups,
+      lr=5e-4,
+      weight_decay=5e-4
+    )
+    # optimizer = MuSGD(
+    #   param_groups,
+    #   lr=1e-4,
+    #   momentum=0.937,
+    #   weight_decay=5e-4
+    # )
     scaler = GradScaler('cuda')
 
-    raw_yolo_architecture = final_model.yolo.model.base_model.model
-    seg_loss_criterion = E2ELoss(raw_yolo_architecture, loss_fn=v8SegmentationLoss)
+    seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
     depth_loss_criterion = L1Loss()
 
     early_stopping = EarlyStoppingAndCheckpointing()
@@ -215,7 +250,7 @@ for model_type in [
       epoch_train_normal_loss = 0.0
       epoch_weighted_train_normal_loss = 0.0
 
-      final_model.train()
+      set_training_mode(final_model, True)
       with autocast(device_type=device_name, dtype=torch.bfloat16):
         for batch_idx, (batch_images, batch_targets) in enumerate(train_loader, 1):
           optimizer.zero_grad()
@@ -230,12 +265,30 @@ for model_type in [
           depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
           normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
 
-          weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
-          weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
-          weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
+          weighted_seg_loss = seg_loss
+          weighted_depth_loss = depth_loss
+          weighted_normal_loss = normal_loss
 
-          loss_total = weighted_seg_loss + weighted_depth_loss + weighted_normal_loss
-          loss_total = loss_total.mean()
+          if model_type == 'vanilla':
+            # Single-task: Pure raw loss
+            loss_total = seg_loss
+          else:
+            # Multi-task: Start with segmentation, which is always active
+            weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
+            loss_components = [weighted_seg_loss]
+
+            # Dynamically add depth if active
+            if include_depth:
+              weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
+              loss_components.append(weighted_depth_loss)
+
+            # Dynamically add normals if active
+            if include_normals:
+              weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
+              loss_components.append(weighted_normal_loss)
+
+            # Sum only the active, weighted components
+            loss_total = sum(loss_components)
 
           scaler.scale(loss_total).backward()
           scaler.step(optimizer)
@@ -243,9 +296,9 @@ for model_type in [
 
           epoch_train_loss += loss_total.item()
           epoch_train_seg_loss += seg_loss.mean().item()
-          epoch_weighted_train_seg_loss = weighted_seg_loss.mean().item()
+          epoch_weighted_train_seg_loss += weighted_seg_loss.mean().item()
           epoch_train_depth_loss += depth_loss.mean().item()
-          epoch_weighted_train_depth_loss = weighted_depth_loss.mean().item()
+          epoch_weighted_train_depth_loss += weighted_depth_loss.mean().item()
           epoch_train_normal_loss += normal_loss.mean().item()
           epoch_weighted_train_normal_loss += weighted_normal_loss.mean().item()
 
@@ -271,7 +324,7 @@ for model_type in [
       epoch_val_normal_loss = 0.0
       epoch_weighted_val_normal_loss = 0.0
 
-      final_model.eval()
+      set_training_mode(final_model, False)
       with torch.no_grad():
         for batch_images_val, batch_targets_val in val_loader:
           segmentation_out, depth_out, normal_out = final_model(batch_images_val.to(device=device))
@@ -292,9 +345,9 @@ for model_type in [
 
           epoch_val_loss += val_loss_total.mean().item()
           epoch_val_seg_loss += seg_loss.mean().item()
-          epoch_weighted_val_seg_loss = weighted_seg_loss.mean().item()
+          epoch_weighted_val_seg_loss += weighted_seg_loss.mean().item()
           epoch_val_depth_loss += depth_loss.mean().item()
-          epoch_weighted_val_depth_loss = weighted_depth_loss.mean().item()
+          epoch_weighted_val_depth_loss += weighted_depth_loss.mean().item()
           epoch_val_normal_loss += normal_loss.mean().item()
           epoch_weighted_val_normal_loss += weighted_normal_loss.mean().item()
 
