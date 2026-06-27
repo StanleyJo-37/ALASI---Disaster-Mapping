@@ -25,7 +25,6 @@ from dotenv import load_dotenv
 import torch
 from peft import LoraConfig, get_peft_model
 from ultralytics.utils.loss import SemanticSegmentationLoss
-from ultralytics.optim import MuSGD
 from torch.optim import AdamW
 from torch.nn import L1Loss
 from torch.amp import autocast
@@ -61,7 +60,7 @@ print('Downloading dataset..')
 print('Defining functions..')
 def set_training_mode(model: torch.nn.Module, mode: bool = True):
   for m in model.modules():
-      m.training = mode
+    m.training = mode
   return model
 
 def create_peft_model(model: TriheadSegmentationModel):
@@ -215,7 +214,7 @@ for model_type in [
     train_loss_history = []
     val_loss_history = []
 
-    for epoch in range(1, TOTAL_EPOCHS + 1, ):
+    for epoch in range(1, TOTAL_EPOCHS + 1):
       epoch_train_loss = 0.0 
       epoch_train_seg_loss = 0.0
       epoch_weighted_train_seg_loss = 0.0
@@ -245,24 +244,19 @@ for model_type in [
           weighted_normal_loss = normal_loss
 
           if model_type == 'vanilla':
-            # Single-task: Pure raw loss
             loss_total = seg_loss
           else:
-            # Multi-task: Start with segmentation, which is always active
             weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
             loss_components = [weighted_seg_loss]
 
-            # Dynamically add depth if active
             if include_depth:
               weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
               loss_components.append(weighted_depth_loss)
 
-            # Dynamically add normals if active
             if include_normals:
               weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
               loss_components.append(weighted_normal_loss)
 
-            # Sum only the active, weighted components
             loss_total = sum(loss_components)
 
           loss_total.backward()

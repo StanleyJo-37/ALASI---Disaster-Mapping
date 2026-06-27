@@ -57,10 +57,7 @@ class TriheadSegmentationModel(torch.nn.Module):
       self.depth_head = DecoderHead(out_channels=1, target_size=self.target_size).to(device)
     
     if self.include_normals:
-      self.normal_head = torch.nn.Sequential(
-        DecoderHead(out_channels=3, target_size=self.target_size),
-        torch.nn.Tanh()
-      ).to(device)
+      self.normal_head = DecoderHead(out_channels=3, target_size=self.target_size).to(device)
   
   def stitch_maps(self, maps_list: List[np.ndarray]) -> np.ndarray:
     return np.array([])
@@ -74,9 +71,11 @@ class TriheadSegmentationModel(torch.nn.Module):
     depth_out = normal_out = None
     
     p5, p4, p3 = self.intercepted_features[2], self.intercepted_features[1], self.intercepted_features[0]
+    
     if self.include_depth:
-      depth_out = self.depth_head(p5, p4, p3)
+      depth_out = self.depth_head(p5=p5, p4=p4, p3=p3)
     if self.include_normals:
-      normal_out = self.normal_head(p5, p4, p3)
+      normal_out = self.normal_head(p5=p5, p4=p4, p3=p3)
+      normal_out = torch.tanh(normal_out)
     
     return segmentation_map, depth_out, normal_out
