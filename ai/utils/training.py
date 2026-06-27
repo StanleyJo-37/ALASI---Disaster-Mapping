@@ -4,6 +4,12 @@ import os
 
 import torch
 
+def minmax_normalize(matrix: torch.Tensor, eps=1e-6) -> torch.Tensor:
+  d_min = matrix.amin(dim=(-2, -1), keepdim=True)
+  d_max = matrix.amax(dim=(-2, -1), keepdim=True)
+  
+  return (matrix - d_min) / (d_max - d_min + eps)
+
 def compute_normal_loss(pred_norm: torch.Tensor, gt_norm: torch.Tensor):
   """ compute per-pixel surface normal error in degrees
     NOTE: pred_norm and gt_norm should be torch tensors of shape (B, 3, ...)

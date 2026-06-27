@@ -28,34 +28,34 @@ from ultralytics.utils.loss import SemanticSegmentationLoss
 from torch.optim import AdamW
 from torch.nn import L1Loss
 from torch.amp import autocast
-# from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download
 
 from datasets.rescuenet_dataset import RescueNetDataset, collate_fn
 from utils.augmentations import get_augmentation_pipeline
 from model.TriheadSegmentationModel import TriheadSegmentationModel
 from model.UncertaintyLossWeighting import UncertaintyLossWeighting
-from utils.training import compute_normal_loss, EarlyStoppingAndCheckpointing
+from utils.training import minmax_normalize, compute_normal_loss, EarlyStoppingAndCheckpointing
 from custom_types.training import AblationStudyType
-# from utils.runpod import terminate_session
+from utils.runpod import terminate_session
 from utils.storage import upload_folder_to_huggingface
 
 print('Loading variables..')
 load_dotenv()
 MODEL_WEIGHT_DIR = 'model/weights'
-TRAIN_BATCH_SIZE = 16
-VAL_BATCH_SIZE = 16
+TRAIN_BATCH_SIZE = 64
+VAL_BATCH_SIZE = 64
 device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_name)
 print(device)
 
 print('Downloading dataset..')
-# os.makedirs('./data', exist_ok=True)
-# snapshot_download(
-#   repo_id=os.environ.get('HF_DATASET_REPO_ID'),
-#   repo_type="dataset",
-#   local_dir="./data",
-#   token=os.environ.get('HF_TOKEN')
-# )
+os.makedirs('./data', exist_ok=True)
+snapshot_download(
+  repo_id=os.environ.get('HF_DATASET_REPO_ID'),
+  repo_type="dataset",
+  local_dir="./data",
+  token=os.environ.get('HF_TOKEN')
+)
 
 print('Defining functions..')
 def set_training_mode(model: torch.nn.Module, mode: bool = True):
@@ -76,6 +76,7 @@ def create_peft_model(model: TriheadSegmentationModel):
     target_modules=valid_target_modules,
     bias="none",
   )
+  
   peft_backbone = get_peft_model(model.yolo_backbone, peft_config=lora_config).to(device)
   peft_backbone.print_trainable_parameters()
   peft_backbone.to(device)
@@ -154,8 +155,6 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     photometric_transform=photometric_aug,
     training=True
   )
-  from torch.utils.data.dataset import Subset
-  train_dataset = Subset(train_dataset, list(range(256)))
   val_dataset = RescueNetDataset(
     data_dir='./data/RescueNet/val',
     include_depth=include_depth,
@@ -180,13 +179,13 @@ def get_depth_and_normals_inclusion(model_type: AblationStudyType) -> tuple[bool
   elif model_type == 'additional-both':
     return True, True
 
-TOTAL_EPOCHS = 5
+TOTAL_EPOCHS = 300
 
 print('Start training - ablation study')
 for model_type in [
-    # 'vanilla',
-    # 'additional-depth',
-    # 'additional-normal',
+    'vanilla',
+    'additional-depth',
+    'additional-normal',
     'additional-both'
   ]:
     raw_yolo_architecture, final_model, loss_balancer = get_model(model_type)
@@ -224,14 +223,20 @@ for model_type in [
       epoch_weighted_train_normal_loss = 0.0
 
       set_training_mode(final_model, True)
-      with autocast(device_type=device_name, dtype=torch.bfloat16):
-        for batch_idx, (batch_images, batch_targets) in enumerate(train_loader, 1):
-          optimizer.zero_grad()
+      
+      for batch_idx, (batch_images, batch_targets) in enumerate(train_loader, 1):
+        optimizer.zero_grad()
 
+        with autocast(device_type=device_name, dtype=torch.bfloat16):
           segmentation_out, depth_out, normal_out = final_model(batch_images.to(device=device))
 
           true_segmentation_map = batch_targets[0]
-          true_depth_map = batch_targets[1]['depth'].to(device=device) if include_depth else None
+          
+          true_depth_map = None
+          if include_depth:
+            true_depth_map = batch_targets[1]['depth'].to(device=device)
+            true_depth_map = minmax_normalize(true_depth_map)
+          
           true_surface_normals = batch_targets[2]['normals'].to(device=device) if include_normals else None
 
           seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
@@ -259,22 +264,22 @@ for model_type in [
 
             loss_total = sum(loss_components)
 
-          loss_total.backward()
-          optimizer.step()
+        loss_total.backward()
+        optimizer.step()
 
-          epoch_train_loss += loss_total.item()
-          epoch_train_seg_loss += seg_loss.mean().item()
-          epoch_weighted_train_seg_loss += weighted_seg_loss.mean().item()
-          epoch_train_depth_loss += depth_loss.mean().item()
-          epoch_weighted_train_depth_loss += weighted_depth_loss.mean().item()
-          epoch_train_normal_loss += normal_loss.mean().item()
-          epoch_weighted_train_normal_loss += weighted_normal_loss.mean().item()
+        epoch_train_loss += loss_total.item()
+        epoch_train_seg_loss += seg_loss.mean().item()
+        epoch_weighted_train_seg_loss += weighted_seg_loss.mean().item()
+        epoch_train_depth_loss += depth_loss.mean().item()
+        epoch_weighted_train_depth_loss += weighted_depth_loss.mean().item()
+        epoch_train_normal_loss += normal_loss.mean().item()
+        epoch_weighted_train_normal_loss += weighted_normal_loss.mean().item()
 
-          print(
-            f"Epoch [{epoch:03d}/{TOTAL_EPOCHS:03d}] Batch [{batch_idx:04d}/{len(train_loader):04d}] | "
-            f"Batch Train Loss: {loss_total.item():.4f} │ "
-            f"LR: {optimizer.param_groups[0]['lr']:.2e}", end='\r'
-          )
+        print(
+          f"Epoch [{epoch:03d}/{TOTAL_EPOCHS:03d}] Batch [{batch_idx:04d}/{len(train_loader):04d}] | "
+          f"Batch Train Loss: {loss_total.item():.4f} │ "
+          f"LR: {optimizer.param_groups[0]['lr']:.2e}", end='\r'
+        )
 
       avg_train_loss = epoch_train_loss / len(train_loader)
       avg_train_seg_loss = epoch_train_seg_loss / len(train_loader)
@@ -295,30 +300,36 @@ for model_type in [
       set_training_mode(final_model, False)
       with torch.no_grad():
         for batch_images_val, batch_targets_val in val_loader:
-          segmentation_out, depth_out, normal_out = final_model(batch_images_val.to(device=device))
+          with autocast(device_type=device_name, dtype=torch.bfloat16):
+            segmentation_out, depth_out, normal_out = final_model(batch_images_val.to(device=device))
 
-          true_segmentation_map = batch_targets_val[0]
-          true_depth_map = batch_targets_val[1]['depth'].to(device=device) if include_depth else None
-          true_surface_normals = batch_targets_val[2]['normals'].to(device=device) if include_normals else None
+            true_segmentation_map = batch_targets_val[0]
+            
+            true_depth_map = None
+            if include_depth:
+              true_depth_map = batch_targets_val[1]['depth'].to(device=device)
+              true_depth_map = minmax_normalize(true_depth_map)
+            
+            true_surface_normals = batch_targets_val[2]['normals'].to(device=device) if include_normals else None
 
-          seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
-          seg_loss /= VAL_BATCH_SIZE
-          depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
-          normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
+            seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
+            seg_loss /= VAL_BATCH_SIZE
+            depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
+            normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
 
-          weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
-          weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
-          weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
+            weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
+            weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
+            weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
 
-          val_loss_total = weighted_seg_loss + weighted_depth_loss + weighted_normal_loss
+            val_loss_total = weighted_seg_loss + weighted_depth_loss + weighted_normal_loss
 
-          epoch_val_loss += val_loss_total.mean().item()
-          epoch_val_seg_loss += seg_loss.mean().item()
-          epoch_weighted_val_seg_loss += weighted_seg_loss.mean().item()
-          epoch_val_depth_loss += depth_loss.mean().item()
-          epoch_weighted_val_depth_loss += weighted_depth_loss.mean().item()
-          epoch_val_normal_loss += normal_loss.mean().item()
-          epoch_weighted_val_normal_loss += weighted_normal_loss.mean().item()
+            epoch_val_loss += val_loss_total.mean().item()
+            epoch_val_seg_loss += seg_loss.mean().item()
+            epoch_weighted_val_seg_loss += weighted_seg_loss.mean().item()
+            epoch_val_depth_loss += depth_loss.mean().item()
+            epoch_weighted_val_depth_loss += weighted_depth_loss.mean().item()
+            epoch_val_normal_loss += normal_loss.mean().item()
+            epoch_weighted_val_normal_loss += weighted_normal_loss.mean().item()
 
       avg_val_loss = epoch_val_loss / len(val_loader)
       avg_val_seg_loss = epoch_val_seg_loss / len(val_loader)
@@ -445,5 +456,5 @@ for model_type in [
     else:
       print("⚠️ CUDA not detected. Only system RAM was flushed.")
 
-# terminate_session()
+terminate_session()
 
