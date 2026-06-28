@@ -36,7 +36,7 @@ from model.TriheadSegmentationModel import TriheadSegmentationModel
 from model.UncertaintyLossWeighting import UncertaintyLossWeighting
 from utils.training import SSILoss, compute_normal_loss, EarlyStoppingAndCheckpointing
 from custom_types.training import AblationStudyType
-from utils.runpod import terminate_session
+from utils.runpod import end_session
 from utils.storage import upload_folder_to_huggingface
 
 print('Loading variables..')
@@ -501,5 +501,4 @@ for model_type in [
   else:
     print("⚠️ CUDA not detected. Only system RAM was flushed.")
 
-terminate_session()
-
+end_session()
