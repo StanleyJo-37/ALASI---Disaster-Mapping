@@ -49,13 +49,13 @@ device = torch.device(device_name)
 print(f'Device used: {device}')
 
 print('Downloading dataset..')
-os.makedirs('./data', exist_ok=True)
-snapshot_download(
-  repo_id=os.environ.get('HF_DATASET_REPO_ID'),
-  repo_type="dataset",
-  local_dir="./data",
-  token=os.environ.get('HF_TOKEN')
-)
+# os.makedirs('./data', exist_ok=True)
+# snapshot_download(
+#   repo_id=os.environ.get('HF_DATASET_REPO_ID'),
+#   repo_type="dataset",
+#   local_dir="./data",
+#   token=os.environ.get('HF_TOKEN')
+# )
 
 print('Defining functions..')
 
