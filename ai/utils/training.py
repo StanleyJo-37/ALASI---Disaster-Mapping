@@ -10,6 +10,24 @@ def minmax_normalize(matrix: torch.Tensor, eps=1e-6) -> torch.Tensor:
   
   return (matrix - d_min) / (d_max - d_min + eps)
 
+class SSILoss(torch.nn.Module):
+  def forward(self, pred, target):
+    B = pred.shape[0]
+    pred_flat = pred.view(B, -1)
+    target_flat = target.view(B, -1)
+
+    pred_mean = pred_flat.mean(dim=1, keepdim=True)
+    target_mean = target_flat.mean(dim=1, keepdim=True)
+    pred_var = ((pred_flat - pred_mean) ** 2).mean(dim=1, keepdim=True)
+    covar = ((pred_flat - pred_mean) * (target_flat - target_mean)).mean(dim=1, keepdim=True)
+
+    scale = covar / (pred_var + 1e-8)
+    shift = target_mean - scale * pred_mean
+
+    pred_aligned = scale * pred_flat + shift
+    return ((pred_aligned - target_flat) ** 2).mean()
+
+
 def compute_normal_loss(pred_norm: torch.Tensor, gt_norm: torch.Tensor):
   """ compute per-pixel surface normal error in degrees
     NOTE: pred_norm and gt_norm should be torch tensors of shape (B, 3, ...)

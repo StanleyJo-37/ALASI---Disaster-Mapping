@@ -74,7 +74,6 @@ class TriheadSegmentationModel(torch.nn.Module):
 
     if self.include_depth:
       depth_out = self.depth_head(p5=p5, p4=p4, p3=p3)
-      depth_out = torch.sigmoid(depth_out)
     if self.include_normals:
       normal_out = self.normal_head(p5=p5, p4=p4, p3=p3)
       normal_out = torch.tanh(normal_out)

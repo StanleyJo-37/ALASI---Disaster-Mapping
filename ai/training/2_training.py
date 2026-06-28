@@ -26,7 +26,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from ultralytics.utils.loss import SemanticSegmentationLoss
 from torch.optim import AdamW
-from torch.nn import L1Loss
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import autocast
 from huggingface_hub import snapshot_download
 
@@ -34,7 +34,7 @@ from datasets.rescuenet_dataset import RescueNetDataset, collate_fn
 from utils.augmentations import get_augmentation_pipeline
 from model.TriheadSegmentationModel import TriheadSegmentationModel
 from model.UncertaintyLossWeighting import UncertaintyLossWeighting
-from utils.training import minmax_normalize, compute_normal_loss, EarlyStoppingAndCheckpointing
+from utils.training import SSILoss, compute_normal_loss, EarlyStoppingAndCheckpointing
 from custom_types.training import AblationStudyType
 from utils.runpod import terminate_session
 from utils.storage import upload_folder_to_huggingface
@@ -46,7 +46,7 @@ TRAIN_BATCH_SIZE = 64
 VAL_BATCH_SIZE = 64
 device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_name)
-print(device)
+print(f'Device used: {device}')
 
 print('Downloading dataset..')
 os.makedirs('./data', exist_ok=True)
@@ -58,6 +58,7 @@ snapshot_download(
 )
 
 print('Defining functions..')
+
 def set_training_mode(model: torch.nn.Module, mode: bool = True):
   for m in model.modules():
     m.training = mode
@@ -180,281 +181,301 @@ def get_depth_and_normals_inclusion(model_type: AblationStudyType) -> tuple[bool
     return True, True
 
 TOTAL_EPOCHS = 300
+TOTAL_STATIC_STEPS = 5
+TOTAL_WARMUP_STEPS = 10
 
 print('Start training - ablation study')
 for model_type in [
-    'vanilla',
-    'additional-depth',
-    'additional-normal',
-    'additional-both'
-  ]:
-    raw_yolo_architecture, final_model, loss_balancer = get_model(model_type)
-    dataset_and_loader = get_dataset_and_loader(model_type)
-    include_depth, include_normals = get_depth_and_normals_inclusion(model_type)
+  'vanilla',
+  'additional-depth',
+  'additional-normal',
+  'additional-both'
+]:
+  raw_yolo_architecture, final_model, loss_balancer = get_model(model_type)
+  dataset_and_loader = get_dataset_and_loader(model_type)
+  include_depth, include_normals = get_depth_and_normals_inclusion(model_type)
 
-    trainable_params = [p for p in final_model.parameters() if p.requires_grad]
-    trainable_params.extend(loss_balancer.parameters())
+  trainable_params = [p for p in final_model.parameters() if p.requires_grad]
+  trainable_params.extend(loss_balancer.parameters())
 
-    optimizer = AdamW(
-      trainable_params,
-      lr=5e-4,
-      weight_decay=5e-4
-    )
+  optimizer = AdamW(
+    trainable_params,
+    lr=5e-4,
+    weight_decay=5e-4
+  )
+  
+  warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
+    optimizer,
+    lr_lambda=lambda step: min((step + 1) / TOTAL_WARMUP_STEPS, 1.0)
+  )
+  static_scheduler = torch.optim.lr_scheduler.LambdaLR(
+    optimizer,
+    lr_lambda=lambda _: 1.0
+  )
+  cosine_annealing_scheduler = CosineAnnealingLR(
+    optimizer,
+    T_max=TOTAL_EPOCHS - TOTAL_WARMUP_STEPS - TOTAL_STATIC_STEPS,
+    eta_min=1e-6
+  )
+  scheduler = torch.optim.lr_scheduler.SequentialLR(
+    optimizer,
+    schedulers=[warmup_scheduler, static_scheduler, cosine_annealing_scheduler],
+    milestones=[TOTAL_WARMUP_STEPS, TOTAL_WARMUP_STEPS+TOTAL_STATIC_STEPS]
+  )
 
-    seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
-    depth_loss_criterion = L1Loss()
+  seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
+  depth_loss_criterion = SSILoss()
 
-    early_stopping = EarlyStoppingAndCheckpointing()
+  early_stopping = EarlyStoppingAndCheckpointing()
 
-    train_loader = dataset_and_loader['train'][1]
-    val_loader = dataset_and_loader['val'][1]
+  train_loader = dataset_and_loader['train'][1]
+  val_loader = dataset_and_loader['val'][1]
 
-    epoch_history = []
-    train_loss_history = []
-    val_loss_history = []
+  epoch_history = []
+  train_loss_history = []
+  val_loss_history = []
 
-    for epoch in range(1, TOTAL_EPOCHS + 1):
-      epoch_train_loss = 0.0 
-      epoch_train_seg_loss = 0.0
-      epoch_weighted_train_seg_loss = 0.0
-      epoch_train_depth_loss = 0.0
-      epoch_weighted_train_depth_loss = 0.0
-      epoch_train_normal_loss = 0.0
-      epoch_weighted_train_normal_loss = 0.0
+  for epoch in range(1, TOTAL_EPOCHS + 1):
+    epoch_train_loss = 0.0 
+    epoch_train_seg_loss = 0.0
+    epoch_weighted_train_seg_loss = 0.0
+    epoch_train_depth_loss = 0.0
+    epoch_weighted_train_depth_loss = 0.0
+    epoch_train_normal_loss = 0.0
+    epoch_weighted_train_normal_loss = 0.0
 
-      set_training_mode(final_model, True)
-      
-      for batch_idx, (batch_images, batch_targets) in enumerate(train_loader, 1):
-        optimizer.zero_grad()
+    set_training_mode(final_model, True)
+    
+    for batch_idx, (batch_images, batch_targets) in enumerate(train_loader, 1):
+      optimizer.zero_grad()
 
-        with autocast(device_type=device_name, dtype=torch.bfloat16):
-          segmentation_out, depth_out, normal_out = final_model(batch_images.to(device=device))
+      with autocast(device_type=device_name, dtype=torch.bfloat16):
+        segmentation_out, depth_out, normal_out = final_model(batch_images.to(device=device))
 
-          true_segmentation_map = batch_targets[0]
-          
-          true_depth_map = None
+        true_segmentation_map = batch_targets[0]
+        
+        true_depth_map = None
+        if include_depth:
+          true_depth_map = batch_targets[1]['depth'].to(device=device)
+        
+        true_surface_normals = batch_targets[2]['normals'].to(device=device) if include_normals else None
+
+        seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
+        seg_loss /= TRAIN_BATCH_SIZE
+        depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
+        normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
+
+        weighted_seg_loss = seg_loss
+        weighted_depth_loss = depth_loss
+        weighted_normal_loss = normal_loss
+
+        if model_type == 'vanilla':
+          loss_total = seg_loss
+        else:
+          weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
+          loss_components = [weighted_seg_loss]
+
           if include_depth:
-            true_depth_map = batch_targets[1]['depth'].to(device=device)
-            true_depth_map = minmax_normalize(true_depth_map)
-          
-          true_surface_normals = batch_targets[2]['normals'].to(device=device) if include_normals else None
-
-          seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
-          seg_loss /= TRAIN_BATCH_SIZE
-          depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
-          normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
-
-          weighted_seg_loss = seg_loss
-          weighted_depth_loss = depth_loss
-          weighted_normal_loss = normal_loss
-
-          if model_type == 'vanilla':
-            loss_total = seg_loss
-          else:
-            weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
-            loss_components = [weighted_seg_loss]
-
-            if include_depth:
-              weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
-              loss_components.append(weighted_depth_loss)
-
-            if include_normals:
-              weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
-              loss_components.append(weighted_normal_loss)
-
-            loss_total = sum(loss_components)
-
-        loss_total.backward()
-        optimizer.step()
-
-        epoch_train_loss += loss_total.item()
-        epoch_train_seg_loss += seg_loss.mean().item()
-        epoch_weighted_train_seg_loss += weighted_seg_loss.mean().item()
-        epoch_train_depth_loss += depth_loss.mean().item()
-        epoch_weighted_train_depth_loss += weighted_depth_loss.mean().item()
-        epoch_train_normal_loss += normal_loss.mean().item()
-        epoch_weighted_train_normal_loss += weighted_normal_loss.mean().item()
-
-        print(
-          f"Epoch [{epoch:03d}/{TOTAL_EPOCHS:03d}] Batch [{batch_idx:04d}/{len(train_loader):04d}] | "
-          f"Batch Train Loss: {loss_total.item():.4f} │ "
-          f"LR: {optimizer.param_groups[0]['lr']:.2e}", end='\r'
-        )
-
-      avg_train_loss = epoch_train_loss / len(train_loader)
-      avg_train_seg_loss = epoch_train_seg_loss / len(train_loader)
-      avg_weighted_train_seg_loss = epoch_weighted_train_seg_loss / len(train_loader)
-      avg_train_depth_loss = epoch_train_depth_loss / len(train_loader)
-      avg_weighted_train_depth_loss = epoch_weighted_train_depth_loss / len(train_loader)
-      avg_train_normal_loss = epoch_train_normal_loss / len(train_loader)
-      avg_weighted_train_normal_loss = epoch_weighted_train_normal_loss / len(train_loader)
-
-      epoch_val_loss = 0.0
-      epoch_val_seg_loss = 0.0
-      epoch_weighted_val_seg_loss = 0.0
-      epoch_val_depth_loss = 0.0
-      epoch_weighted_val_depth_loss = 0.0
-      epoch_val_normal_loss = 0.0
-      epoch_weighted_val_normal_loss = 0.0
-
-      set_training_mode(final_model, False)
-      with torch.no_grad():
-        for batch_images_val, batch_targets_val in val_loader:
-          with autocast(device_type=device_name, dtype=torch.bfloat16):
-            segmentation_out, depth_out, normal_out = final_model(batch_images_val.to(device=device))
-
-            true_segmentation_map = batch_targets_val[0]
-            
-            true_depth_map = None
-            if include_depth:
-              true_depth_map = batch_targets_val[1]['depth'].to(device=device)
-              true_depth_map = minmax_normalize(true_depth_map)
-            
-            true_surface_normals = batch_targets_val[2]['normals'].to(device=device) if include_normals else None
-
-            seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
-            seg_loss /= VAL_BATCH_SIZE
-            depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
-            normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
-
-            weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
             weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
+            loss_components.append(weighted_depth_loss)
+
+          if include_normals:
             weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
+            loss_components.append(weighted_normal_loss)
 
-            val_loss_total = weighted_seg_loss + weighted_depth_loss + weighted_normal_loss
+          loss_total = sum(loss_components)
 
-            epoch_val_loss += val_loss_total.mean().item()
-            epoch_val_seg_loss += seg_loss.mean().item()
-            epoch_weighted_val_seg_loss += weighted_seg_loss.mean().item()
-            epoch_val_depth_loss += depth_loss.mean().item()
-            epoch_weighted_val_depth_loss += weighted_depth_loss.mean().item()
-            epoch_val_normal_loss += normal_loss.mean().item()
-            epoch_weighted_val_normal_loss += weighted_normal_loss.mean().item()
+      loss_total.backward()
+      optimizer.step()
 
-      avg_val_loss = epoch_val_loss / len(val_loader)
-      avg_val_seg_loss = epoch_val_seg_loss / len(val_loader)
-      avg_weighted_val_seg_loss = epoch_weighted_val_seg_loss / len(val_loader)
-      avg_val_depth_loss = epoch_val_depth_loss / len(val_loader)
-      avg_weighted_val_depth_loss = epoch_weighted_val_depth_loss / len(val_loader)
-      avg_val_normal_loss = epoch_val_normal_loss / len(val_loader)
-      avg_weighted_val_normal_loss = epoch_weighted_val_normal_loss / len(val_loader)
-
-      # Record the metrics
-      epoch_history.append(epoch)
-      train_loss_history.append({
-        'loss': avg_train_loss,
-        'seg_loss': avg_train_seg_loss,
-        'weighted_seg_loss': avg_weighted_train_seg_loss,
-        'depth_loss': avg_train_depth_loss,
-        'weighted_depth_loss': avg_weighted_train_depth_loss,
-        'normal_loss': avg_train_normal_loss,
-        'weighted_normal_loss': avg_weighted_train_normal_loss
-      })
-      val_loss_history.append({
-        'loss': avg_val_loss,
-        'seg_loss': avg_val_seg_loss,
-        'weighted_seg_loss': avg_weighted_val_seg_loss,
-        'depth_loss': avg_val_depth_loss,
-        'weighted_depth_loss': avg_weighted_val_depth_loss,
-        'normal_loss': avg_val_normal_loss,
-        'weighted_normal_loss': avg_weighted_val_normal_loss
-      })
-
-      # Early Stopping evaluated ONCE per epoch using the average validation loss
-      halt = early_stopping.record_and_check_if_halt(avg_val_loss, final_model.state_dict(), loss_balancer.state_dict())
+      epoch_train_loss += loss_total.item()
+      epoch_train_seg_loss += seg_loss.mean().item()
+      epoch_weighted_train_seg_loss += weighted_seg_loss.mean().item()
+      epoch_train_depth_loss += depth_loss.mean().item()
+      epoch_weighted_train_depth_loss += weighted_depth_loss.mean().item()
+      epoch_train_normal_loss += normal_loss.mean().item()
+      epoch_weighted_train_normal_loss += weighted_normal_loss.mean().item()
 
       print(
         f"Epoch [{epoch:03d}/{TOTAL_EPOCHS:03d}] Batch [{batch_idx:04d}/{len(train_loader):04d}] | "
-        f"LR: {optimizer.param_groups[0]['lr']:.2e}\n",
-        f"============================================\n"
-        f"---TRAINING---\n"
-        f"- Total Loss: {avg_train_loss:.4f}\n"
-        f"- Seg: {avg_train_seg_loss:.4f}\n"
-        f"- Depth: {avg_train_depth_loss:.4f}\n"
-        f"- Norm: {avg_train_normal_loss:.4f}\n"
-        f"============================================\n"
-        f"---VALIDATION---\n"
-        f"- Total Loss: {avg_val_loss:.4f}\n"
-        f"- Seg: {avg_val_seg_loss:.4f}\n"
-        f"- Depth: {avg_val_depth_loss:.4f}\n"
-        f"- Norm: {avg_val_normal_loss:.4f}\n"
+        f"Batch Train Loss: {loss_total.item():.4f} │ "
+        f"LR: {optimizer.param_groups[0]['lr']:.2e}", end='\r'
       )
 
-      if halt:
-        break
+    scheduler.step()
 
-    early_stopping.save_weights('./', model_type, final_model.state_dict(), loss_balancer.state_dict())
+    avg_train_loss = epoch_train_loss / len(train_loader)
+    avg_train_seg_loss = epoch_train_seg_loss / len(train_loader)
+    avg_weighted_train_seg_loss = epoch_weighted_train_seg_loss / len(train_loader)
+    avg_train_depth_loss = epoch_train_depth_loss / len(train_loader)
+    avg_weighted_train_depth_loss = epoch_weighted_train_depth_loss / len(train_loader)
+    avg_train_normal_loss = epoch_train_normal_loss / len(train_loader)
+    avg_weighted_train_normal_loss = epoch_weighted_train_normal_loss / len(train_loader)
 
-    os.makedirs('eval_results', exist_ok=True)
-    csv_filename = f"eval_results/{model_type}_loss_history.csv"
-    with open(csv_filename, mode='w', newline='') as file:
-      writer = csv.writer(file)
+    epoch_val_loss = 0.0
+    epoch_val_seg_loss = 0.0
+    epoch_weighted_val_seg_loss = 0.0
+    epoch_val_depth_loss = 0.0
+    epoch_weighted_val_depth_loss = 0.0
+    epoch_val_normal_loss = 0.0
+    epoch_weighted_val_normal_loss = 0.0
+
+    set_training_mode(final_model, False)
+    with torch.no_grad():
+      for batch_images_val, batch_targets_val in val_loader:
+        with autocast(device_type=device_name, dtype=torch.bfloat16):
+          segmentation_out, depth_out, normal_out = final_model(batch_images_val.to(device=device))
+
+          true_segmentation_map = batch_targets_val[0]
+          
+          true_depth_map = None
+          if include_depth:
+            true_depth_map = batch_targets_val[1]['depth'].to(device=device)
+          
+          true_surface_normals = batch_targets_val[2]['normals'].to(device=device) if include_normals else None
+
+          seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
+          seg_loss /= VAL_BATCH_SIZE
+          depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
+          normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
+
+          weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
+          weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
+          weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
+
+          val_loss_total = weighted_seg_loss + weighted_depth_loss + weighted_normal_loss
+
+          epoch_val_loss += val_loss_total.mean().item()
+          epoch_val_seg_loss += seg_loss.mean().item()
+          epoch_weighted_val_seg_loss += weighted_seg_loss.mean().item()
+          epoch_val_depth_loss += depth_loss.mean().item()
+          epoch_weighted_val_depth_loss += weighted_depth_loss.mean().item()
+          epoch_val_normal_loss += normal_loss.mean().item()
+          epoch_weighted_val_normal_loss += weighted_normal_loss.mean().item()
+
+    avg_val_loss = epoch_val_loss / len(val_loader)
+    avg_val_seg_loss = epoch_val_seg_loss / len(val_loader)
+    avg_weighted_val_seg_loss = epoch_weighted_val_seg_loss / len(val_loader)
+    avg_val_depth_loss = epoch_val_depth_loss / len(val_loader)
+    avg_weighted_val_depth_loss = epoch_weighted_val_depth_loss / len(val_loader)
+    avg_val_normal_loss = epoch_val_normal_loss / len(val_loader)
+    avg_weighted_val_normal_loss = epoch_weighted_val_normal_loss / len(val_loader)
+
+    # Record the metrics
+    epoch_history.append(epoch)
+    train_loss_history.append({
+      'loss': avg_train_loss,
+      'seg_loss': avg_train_seg_loss,
+      'weighted_seg_loss': avg_weighted_train_seg_loss,
+      'depth_loss': avg_train_depth_loss,
+      'weighted_depth_loss': avg_weighted_train_depth_loss,
+      'normal_loss': avg_train_normal_loss,
+      'weighted_normal_loss': avg_weighted_train_normal_loss
+    })
+    val_loss_history.append({
+      'loss': avg_val_loss,
+      'seg_loss': avg_val_seg_loss,
+      'weighted_seg_loss': avg_weighted_val_seg_loss,
+      'depth_loss': avg_val_depth_loss,
+      'weighted_depth_loss': avg_weighted_val_depth_loss,
+      'normal_loss': avg_val_normal_loss,
+      'weighted_normal_loss': avg_weighted_val_normal_loss
+    })
+
+    # Early Stopping evaluated ONCE per epoch using the average validation loss
+    halt = early_stopping.record_and_check_if_halt(avg_val_loss, final_model.state_dict(), loss_balancer.state_dict())
+    print(
+      f"Epoch [{epoch:03d}/{TOTAL_EPOCHS:03d}] Batch [{batch_idx:04d}/{len(train_loader):04d}] | "
+      f"LR: {optimizer.param_groups[0]['lr']:.6f}\n",
+      f"============================================\n"
+      f"---TRAINING---\n"
+      f"- Total Loss: {avg_train_loss:.4f}\n"
+      f"- Seg: {avg_train_seg_loss:.4f}\n"
+      f"- Depth: {avg_train_depth_loss:.4f}\n"
+      f"- Norm: {avg_train_normal_loss:.4f}\n"
+      f"============================================\n"
+      f"---VALIDATION---\n"
+      f"- Total Loss: {avg_val_loss:.4f}\n"
+      f"- Seg: {avg_val_seg_loss:.4f}\n"
+      f"- Depth: {avg_val_depth_loss:.4f}\n"
+      f"- Norm: {avg_val_normal_loss:.4f}\n"
+    )
+
+    if halt:
+      break
+
+  early_stopping.save_weights('./', model_type, final_model.state_dict(), loss_balancer.state_dict())
+
+  os.makedirs('eval_results', exist_ok=True)
+  csv_filename = f"eval_results/{model_type}_loss_history.csv"
+  with open(csv_filename, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow([
+      'epoch',
+      'train_loss',
+      'train_seg_loss',
+      'train_weighted_seg_loss',
+      'train_depth_loss',
+      'train_weighted_depth_loss',
+      'train_normal_loss',
+      'train_weighted_normal_loss',
+      'val_loss',
+      'val_seg_loss',
+      'val_weighted_seg_loss',
+      'val_depth_loss',
+      'val_weighted_depth_loss',
+      'val_normal_loss',
+      'val_weighted_normal_loss',
+    ])
+    for i in range(len(epoch_history)):
       writer.writerow([
-        'epoch',
-        'train_loss',
-        'train_seg_loss',
-        'train_weighted_seg_loss',
-        'train_depth_loss',
-        'train_weighted_depth_loss',
-        'train_normal_loss',
-        'train_weighted_normal_loss',
-        'val_loss',
-        'val_seg_loss',
-        'val_weighted_seg_loss',
-        'val_depth_loss',
-        'val_weighted_depth_loss',
-        'val_normal_loss',
-        'val_weighted_normal_loss',
+        epoch_history[i], 
+        train_loss_history[i]['loss'],
+        train_loss_history[i]['seg_loss'],
+        train_loss_history[i]['weighted_seg_loss'],
+        train_loss_history[i]['depth_loss'],
+        train_loss_history[i]['weighted_depth_loss'],
+        train_loss_history[i]['normal_loss'],
+        train_loss_history[i]['weighted_normal_loss'],
+        val_loss_history[i]['loss'],
+        val_loss_history[i]['seg_loss'],
+        val_loss_history[i]['weighted_seg_loss'],
+        val_loss_history[i]['depth_loss'],
+        val_loss_history[i]['weighted_depth_loss'],
+        val_loss_history[i]['normal_loss'],
+        val_loss_history[i]['weighted_normal_loss'],
       ])
-      for i in range(len(epoch_history)):
-        writer.writerow([
-          epoch_history[i], 
-          train_loss_history[i]['loss'],
-          train_loss_history[i]['seg_loss'],
-          train_loss_history[i]['weighted_seg_loss'],
-          train_loss_history[i]['depth_loss'],
-          train_loss_history[i]['weighted_depth_loss'],
-          train_loss_history[i]['normal_loss'],
-          train_loss_history[i]['weighted_normal_loss'],
-          val_loss_history[i]['loss'],
-          val_loss_history[i]['seg_loss'],
-          val_loss_history[i]['weighted_seg_loss'],
-          val_loss_history[i]['depth_loss'],
-          val_loss_history[i]['weighted_depth_loss'],
-          val_loss_history[i]['normal_loss'],
-          val_loss_history[i]['weighted_normal_loss'],
-        ])
-    print(f"Saved training history to {csv_filename}")
+  print(f"Saved training history to {csv_filename}")
 
-    upload_folder_to_huggingface(
-      'weights',
-      'weights'
-    )
-    upload_folder_to_huggingface(
-      'eval_results',
-      'eval_results'
-    )
-    
-    # Cleanup
-    del final_model, loss_balancer, optimizer, train_loader, val_loader, dataset_and_loader
+  upload_folder_to_huggingface(
+    'weights',
+    'weights'
+  )
+  upload_folder_to_huggingface(
+    'eval_results',
+    'eval_results'
+  )
+  
+  # Cleanup
+  del final_model, loss_balancer, optimizer, train_loader, val_loader, dataset_and_loader
 
-    unreachable_object = gc.collect()
+  unreachable_object = gc.collect()
 
-    if torch.cuda.is_available():
-      alloc_before = torch.cuda.memory_allocated() / (1024 ** 3)
-      res_before = torch.cuda.memory_reserved() / (1024 ** 3)
+  if torch.cuda.is_available():
+    alloc_before = torch.cuda.memory_allocated() / (1024 ** 3)
+    res_before = torch.cuda.memory_reserved() / (1024 ** 3)
 
-      torch.cuda.empty_cache()
-      torch.cuda.ipc_collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
 
-      alloc_after = torch.cuda.memory_allocated() / (1024 ** 3)
-      res_after = torch.cuda.memory_reserved() / (1024 ** 3)
+    alloc_after = torch.cuda.memory_allocated() / (1024 ** 3)
+    res_after = torch.cuda.memory_reserved() / (1024 ** 3)
 
-      print(f"VRAM Allocated: {alloc_before:.2f} GB  ->  {alloc_after:.2f} GB")
-      print(f"VRAM Reserved:  {res_before:.2f} GB  ->  {res_after:.2f} GB")
-      print("✅ PyTorch CUDA cache successfully flushed!")
-    else:
-      print("⚠️ CUDA not detected. Only system RAM was flushed.")
+    print(f"VRAM Allocated: {alloc_before:.2f} GB  ->  {alloc_after:.2f} GB")
+    print(f"VRAM Reserved:  {res_before:.2f} GB  ->  {res_after:.2f} GB")
+    print("✅ PyTorch CUDA cache successfully flushed!")
+  else:
+    print("⚠️ CUDA not detected. Only system RAM was flushed.")
 
 terminate_session()
 
