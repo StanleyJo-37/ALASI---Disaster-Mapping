@@ -2,6 +2,7 @@ from typing import Optional, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from ultralytics import YOLO
 
 from .DecoderHead import DecoderHead
@@ -76,6 +77,6 @@ class TriheadSegmentationModel(torch.nn.Module):
       depth_out = self.depth_head(p5=p5, p4=p4, p3=p3)
     if self.include_normals:
       normal_out = self.normal_head(p5=p5, p4=p4, p3=p3)
-      normal_out = torch.tanh(normal_out)
+      normal_out = F.normalize(torch.tanh(normal_out), dim=1)
     
     return segmentation_map, depth_out, normal_out

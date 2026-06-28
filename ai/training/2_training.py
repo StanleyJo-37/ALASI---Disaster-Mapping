@@ -129,7 +129,7 @@ def get_model(model_type: AblationStudyType):
   infuse_args(model)
   raw_yolo_architecture = model.yolo_backbone
   final_model = create_peft_model(model)
-  loss_balancer = UncertaintyLossWeighting()
+  loss_balancer = UncertaintyLossWeighting().to(device=device)
 
   return raw_yolo_architecture, final_model, loss_balancer
 
@@ -261,7 +261,7 @@ for model_type in [
         true_surface_normals = batch_targets[2]['normals'].to(device=device) if include_normals else None
 
         seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
-        seg_loss /= TRAIN_BATCH_SIZE
+        seg_loss /= batch_images.shape[0]
         depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
         normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
 
@@ -272,18 +272,21 @@ for model_type in [
         if model_type == 'vanilla':
           loss_total = seg_loss
         else:
-          weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
-          loss_components = [weighted_seg_loss]
-
-          if include_depth:
-            weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
-            loss_components.append(weighted_depth_loss)
-
-          if include_normals:
-            weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
-            loss_components.append(weighted_normal_loss)
-
-          loss_total = sum(loss_components)
+          loss_total = loss_balancer(
+            seg_loss,
+            depth_loss if include_depth else None,
+            normal_loss if include_normals else None
+          )
+          
+          weighted_seg_loss = torch.exp(-loss_balancer.alpha) * seg_loss + loss_balancer.alpha
+          weighted_depth_loss = (
+            torch.exp(-loss_balancer.beta) * depth_loss + loss_balancer.beta
+            if include_depth else torch.tensor(0.0, device=device)
+          )
+          weighted_normal_loss = (
+            torch.exp(-loss_balancer.gamma) * normal_loss + loss_balancer.gamma
+            if include_normals else torch.tensor(0.0, device=device)
+          )
 
       loss_total.backward()
       optimizer.step()
@@ -335,15 +338,32 @@ for model_type in [
           true_surface_normals = batch_targets_val[2]['normals'].to(device=device) if include_normals else None
 
           seg_loss, seg_loss_items = seg_loss_criterion(segmentation_out, true_segmentation_map)
-          seg_loss /= VAL_BATCH_SIZE
+          seg_loss /= batch_images_val.shape[0]
           depth_loss = depth_loss_criterion(depth_out, true_depth_map) if include_depth else torch.tensor(0.0, device=device)
           normal_loss = compute_normal_loss(normal_out, true_surface_normals) if include_normals else torch.tensor(0.0, device=device)
 
-          weighted_seg_loss = torch.abs(loss_balancer.alpha).to(device) * seg_loss
-          weighted_depth_loss = torch.abs(loss_balancer.beta).to(device) * depth_loss
-          weighted_normal_loss = torch.abs(loss_balancer.gamma).to(device) * normal_loss
+          weighted_seg_loss = seg_loss
+          weighted_depth_loss = depth_loss
+          weighted_normal_loss = normal_loss
 
-          val_loss_total = weighted_seg_loss + weighted_depth_loss + weighted_normal_loss
+          if model_type == 'vanilla':
+            val_loss_total = seg_loss
+          else:
+            val_loss_total = loss_balancer(
+              seg_loss,
+              depth_loss if include_depth else None,
+              normal_loss if include_normals else None
+            )
+            
+            weighted_seg_loss = torch.exp(-loss_balancer.alpha) * seg_loss + loss_balancer.alpha
+            weighted_depth_loss = (
+              torch.exp(-loss_balancer.beta) * depth_loss + loss_balancer.beta
+              if include_depth else torch.tensor(0.0, device=device)
+            )
+            weighted_normal_loss = (
+              torch.exp(-loss_balancer.gamma) * normal_loss + loss_balancer.gamma
+              if include_normals else torch.tensor(0.0, device=device)
+            )
 
           epoch_val_loss += val_loss_total.mean().item()
           epoch_val_seg_loss += seg_loss.mean().item()
@@ -383,7 +403,11 @@ for model_type in [
     })
 
     # Early Stopping evaluated ONCE per epoch using the average validation loss
-    halt = early_stopping.record_and_check_if_halt(avg_val_loss, final_model.state_dict(), loss_balancer.state_dict())
+    halt = early_stopping.record_and_check_if_halt(
+      avg_val_loss,
+      final_model.state_dict(),
+      loss_balancer.state_dict()
+    )
     print(
       f"Epoch [{epoch:03d}/{TOTAL_EPOCHS:03d}] Batch [{batch_idx:04d}/{len(train_loader):04d}] | "
       f"LR: {optimizer.param_groups[0]['lr']:.6f}\n",
@@ -457,7 +481,7 @@ for model_type in [
   )
   
   # Cleanup
-  del final_model, loss_balancer, optimizer, train_loader, val_loader, dataset_and_loader
+  del final_model, loss_balancer, optimizer, scheduler, train_loader, val_loader, dataset_and_loader
 
   unreachable_object = gc.collect()
 
