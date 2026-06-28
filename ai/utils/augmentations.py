@@ -10,7 +10,6 @@ def get_augmentation_pipeline() -> Tuple[A.Compose, A.Compose]:
   spatial = A.ReplayCompose([
     A.VerticalFlip(p=0.5),
     A.HorizontalFlip(p=0.5),
-    A.RandomRotate90(p=0.5),
     A.Affine(
       scale=(0.85, 1.15),
       interpolation=cv2.INTER_LINEAR,
