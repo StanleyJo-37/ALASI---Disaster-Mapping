@@ -30,7 +30,7 @@ def get_augmentation_pipeline() -> Tuple[A.Compose, A.Compose]:
       contrast_range=(0.0, 0.2),
       p=0.4
     ),
-    A.HueSaturationValue(),
+    A.HueSaturationValue(p=0.3),
     A.CoarseDropout(
       num_holes_range=(1, 8),
       fill_mask=0,
