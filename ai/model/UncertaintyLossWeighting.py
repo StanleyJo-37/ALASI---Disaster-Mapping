@@ -3,14 +3,12 @@ from typing import Optional
 import torch
 
 class UncertaintyLossWeighting(torch.nn.Module):
-  def __init__(self, device: str = 'cuda'):
+  def __init__(self):
     super(UncertaintyLossWeighting, self).__init__()
     
-    self.device = device
-    
-    self.alpha = torch.nn.Parameter(torch.ones(1, device=device))
-    self.beta = torch.nn.Parameter(torch.ones(1, device=device))
-    self.gamma = torch.nn.Parameter(torch.ones(1, device=device))
+    self.alpha = torch.nn.Parameter(torch.ones(1))
+    self.beta = torch.nn.Parameter(torch.ones(1))
+    self.gamma = torch.nn.Parameter(torch.ones(1))
     
   
   def forward(
