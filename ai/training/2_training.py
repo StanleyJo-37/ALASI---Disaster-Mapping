@@ -152,6 +152,7 @@ def get_dataset_and_loader(model_type: AblationStudyType):
   train_dataset = RescueNetDataset(
     data_dir='./data/RescueNet/train',
     include_depth=include_depth,
+    include_normals=include_normals,
     spatial_transform=spatial_aug,
     photometric_transform=photometric_aug,
     training=True

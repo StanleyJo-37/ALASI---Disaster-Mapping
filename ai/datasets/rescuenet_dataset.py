@@ -2,6 +2,7 @@ from pathlib import Path
 import os
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from skimage import io
 import numpy as np
@@ -98,7 +99,7 @@ class RescueNetDataset(Dataset):
       target['semantic_mask'] = torch.from_numpy(label).long()
       
       if self.include_depth:
-        target['depth_map'] = torch.from_numpy(depth)
+        target['depth_map'] = torch.from_numpy(depth).unsqueeze(0)
       
       if self.include_normals:
         normals_tensor = torch.from_numpy(normals).permute(2, 0, 1).float()
@@ -107,9 +108,10 @@ class RescueNetDataset(Dataset):
       val_image = torch.from_numpy(image).permute(2, 0, 1).float()
       if val_image.max() > 1.0:
           val_image /= 255.0
-          
+      
       return val_image, target
     
+    aug_rgb = image.copy()
     aug_mask = label
     aug_depth = depth
     aug_normals = normals
@@ -129,14 +131,25 @@ class RescueNetDataset(Dataset):
       if self.include_normals:
         for transform in augmented['replay']['transforms']:
           if transform['__class_fullname__'] == 'HorizontalFlip' and transform['applied']:
-            aug_normals[:, :, 0] *= -1.0 
+            aug_normals[0, :, :] *= -1.0 
               
           if transform['__class_fullname__'] == 'VerticalFlip' and transform['applied']:
-            aug_normals[:, :, 1] *= -1.0
-      
-        norm = np.linalg.norm(aug_normals, axis=-1, keepdims=True)
-        aug_normals = np.divide(aug_normals, norm, out=np.zeros_like(aug_normals), where=norm!=0)
-        aug_normals = torch.from_numpy(aug_normals)
+            aug_normals[1, :, :] *= -1.0
+          
+          if transform['__class_fullname__'] == 'SafeRotate' and transform['applied']:
+            transform_params = transform['params']
+
+            rotate = transform_params['rotate']
+            angle_rad = np.deg2rad(rotate)
+            sin_theta, cos_theta = np.sin(angle_rad), np.cos(angle_rad)
+
+            nx = aug_normals[0, :, :].clone()
+            ny = aug_normals[1, :, :].clone()
+            
+            aug_normals[0, :, :] = cos_theta * nx - sin_theta * ny
+            aug_normals[1, :, :] = sin_theta * nx + cos_theta * ny
+
+        aug_normals = F.normalize(aug_normals.float(), dim=0)
     
     if self.photometric_transform:
       aug_rgb = self.photometric_transform(image=aug_rgb.permute(1, 2, 0).numpy())['image']
@@ -145,12 +158,14 @@ class RescueNetDataset(Dataset):
     if aug_rgb.max() > 1.0:
       aug_rgb /= 255.0
 
-    label_tensor = aug_mask.long()
+    label_tensor = torch.as_tensor(aug_mask, dtype=torch.long)
     target['semantic_mask'] = label_tensor
     
-    depth_tensor = aug_depth.unsqueeze(0).float() if self.include_depth else None
-    
     if self.include_depth:
+      if isinstance(aug_depth, np.ndarray):
+        depth_tensor = torch.from_numpy(aug_depth).unsqueeze(0).float()
+      else:
+        depth_tensor = aug_depth.float()
       target['depth_map'] = depth_tensor
     
     if self.include_normals:
