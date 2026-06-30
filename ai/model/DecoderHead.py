@@ -17,7 +17,7 @@ class DecoderHead(nn.Module):
     self.output_block = nn.Sequential(
       self.create_output_block(128, 64, 3, 1), # 64, 320, 320
       self.create_output_block(64, 32, 3, 1), # 32, 320, 320
-      self.create_output_block(32, 16, 3, 1), # 16, 320, 320
+      self.create_output_block(32, 16, 3, 1, dropout_out=0.0), # 16, 320, 320
       
       nn.Conv2d(16, out_channels, kernel_size=1) # out, 320, 320
     )
@@ -27,12 +27,15 @@ class DecoderHead(nn.Module):
     in_channel: int,
     out_channel: int,
     kernel_size: int | tuple[int, int],
-    padding: int | tuple[int, int]
+    padding: int | tuple[int, int],
+    dropout_out: float = 0.1
   ):
     return nn.Sequential(
-      nn.Conv2d(in_channel, out_channel, kernel_size=kernel_size, padding=padding),
+      nn.Conv2d(in_channel, out_channel, kernel_size=kernel_size, padding=padding, bias=False),
       nn.BatchNorm2d(out_channel),
       nn.SiLU(inplace=True),
+      
+      nn.Dropout2d(dropout_out),
     )
     
   def _icnr_init(
@@ -71,6 +74,7 @@ class DecoderHead(nn.Module):
       nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
       nn.BatchNorm2d(out_channels),
       nn.SiLU(inplace=True),
+      nn.Dropout2d(0.2),
     )
   
   def forward(self, p5, p4, p3):

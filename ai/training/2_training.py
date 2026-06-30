@@ -29,6 +29,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import autocast
 from huggingface_hub import snapshot_download
+import cv2
 
 from datasets.rescuenet_dataset import RescueNetDataset, collate_fn
 from utils.augmentations import get_augmentation_pipeline
@@ -39,11 +40,13 @@ from custom_types.training import AblationStudyType
 from utils.runpod import end_session
 from utils.storage import upload_folder_to_huggingface
 
+
+
 print('Loading variables..')
 load_dotenv()
 MODEL_WEIGHT_DIR = 'model/weights'
-TRAIN_BATCH_SIZE = 64
-VAL_BATCH_SIZE = 64
+TRAIN_BATCH_SIZE = 8
+VAL_BATCH_SIZE = 8
 device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_name)
 print(f'Device used: {device}')
@@ -59,6 +62,9 @@ print('Downloading dataset..')
 
 print('Defining functions..')
 
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
+
 def set_training_mode(model: torch.nn.Module, mode: bool = True):
   for m in model.modules():
     m.training = mode
@@ -72,8 +78,9 @@ def create_peft_model(model: TriheadSegmentationModel):
         valid_target_modules.append(name)
 
   lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.05,
     target_modules=valid_target_modules,
     bias="none",
   )
@@ -148,9 +155,9 @@ def get_dataset_and_loader(model_type: AblationStudyType):
   elif model_type == 'additional-both':
     include_depth = True
     include_normals = True
-  
+
   train_dataset = RescueNetDataset(
-    data_dir='./data/RescueNet/train',
+    data_dir='/dev/shm/data/RescueNet/RescueNet/train',
     include_depth=include_depth,
     include_normals=include_normals,
     spatial_transform=spatial_aug,
@@ -158,14 +165,30 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     training=True
   )
   val_dataset = RescueNetDataset(
-    data_dir='./data/RescueNet/val',
+    data_dir='/dev/shm/data/RescueNet/RescueNet/val',
     include_depth=include_depth,
     include_normals=include_normals
   )
 
-  train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-  val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=VAL_BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-  
+  train_loader = torch.utils.data.DataLoader(
+    train_dataset,
+    batch_size=TRAIN_BATCH_SIZE,
+    shuffle=True,
+    collate_fn=collate_fn,
+    num_workers=8,
+    pin_memory=True,
+    prefetch_factor=2
+  )
+  val_loader = torch.utils.data.DataLoader(
+    val_dataset,
+    batch_size=VAL_BATCH_SIZE,
+    shuffle=False,
+    collate_fn=collate_fn,
+    num_workers=4,
+    pin_memory=True,
+    prefetch_factor=2
+  )
+
   return {
     'train': (train_dataset, train_loader),
     'val': (val_dataset, val_loader),
@@ -187,10 +210,10 @@ TOTAL_WARMUP_STEPS = 10
 
 print('Start training - ablation study')
 for model_type in [
-  'vanilla',
-  'additional-depth',
+  # 'vanilla',
+  'additional-both',
   'additional-normal',
-  'additional-both'
+  'additional-depth'
 ]:
   raw_yolo_architecture, final_model, loss_balancer = get_model(model_type)
   dataset_and_loader = get_dataset_and_loader(model_type)
@@ -201,8 +224,8 @@ for model_type in [
 
   optimizer = AdamW(
     trainable_params,
-    lr=5e-4,
-    weight_decay=5e-4
+    lr=2e-4,
+    weight_decay=1e-2
   )
   
   warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -227,7 +250,7 @@ for model_type in [
   seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
   depth_loss_criterion = SSILoss()
 
-  early_stopping = EarlyStoppingAndCheckpointing()
+  early_stopping = EarlyStoppingAndCheckpointing(patience=25, delta=0.01)
 
   train_loader = dataset_and_loader['train'][1]
   val_loader = dataset_and_loader['val'][1]
@@ -502,4 +525,4 @@ for model_type in [
   else:
     print("⚠️ CUDA not detected. Only system RAM was flushed.")
 
-end_session()
+# end_session()
