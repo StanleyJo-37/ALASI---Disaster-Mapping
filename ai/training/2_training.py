@@ -204,13 +204,13 @@ def get_depth_and_normals_inclusion(model_type: AblationStudyType) -> tuple[bool
   elif model_type == 'additional-both':
     return True, True
 
-TOTAL_EPOCHS = 300
-TOTAL_STATIC_STEPS = 5
-TOTAL_WARMUP_STEPS = 10
+TOTAL_EPOCHS = 50
+TOTAL_STATIC_STEPS = 3
+TOTAL_WARMUP_STEPS = 2
 
 print('Start training - ablation study')
 for model_type in [
-  # 'vanilla',
+  'vanilla',
   'additional-both',
   'additional-normal',
   'additional-depth'
