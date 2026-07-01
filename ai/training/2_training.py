@@ -72,10 +72,14 @@ def set_training_mode(model: torch.nn.Module, mode: bool = True):
 
 def create_peft_model(model: TriheadSegmentationModel):
   valid_target_modules = []
-  for name, module in model.yolo_backbone.named_modules():
-    if isinstance(module, torch.nn.Conv2d):
-      if module.groups == 1:
-        valid_target_modules.append(name)
+  
+  backbone_layers = list(model.yolo_backbone.model.children())[:11]
+    
+  for layer_idx, layer in enumerate(backbone_layers):
+    for name, module in layer.named_modules():
+      if isinstance(module, torch.nn.Conv2d) and module.groups == 1:
+        full_name = f"model.{layer_idx}.{name}" if name else f"model.{layer_idx}"
+        valid_target_modules.append(full_name)
 
   lora_config = LoraConfig(
     r=8,
@@ -179,6 +183,7 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     pin_memory=True,
     prefetch_factor=2
   )
+  
   val_loader = torch.utils.data.DataLoader(
     val_dataset,
     batch_size=VAL_BATCH_SIZE,
@@ -210,8 +215,8 @@ TOTAL_WARMUP_STEPS = 2
 
 print('Start training - ablation study')
 for model_type in [
-  'vanilla',
   'additional-both',
+  'vanilla',
   'additional-normal',
   'additional-depth'
 ]:
@@ -250,7 +255,7 @@ for model_type in [
   seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
   depth_loss_criterion = SSILoss()
 
-  early_stopping = EarlyStoppingAndCheckpointing(patience=25, delta=0.01)
+  early_stopping = EarlyStoppingAndCheckpointing(patience=10, delta=0.01)
 
   train_loader = dataset_and_loader['train'][1]
   val_loader = dataset_and_loader['val'][1]
