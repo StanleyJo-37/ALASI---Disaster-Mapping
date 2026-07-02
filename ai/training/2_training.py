@@ -161,7 +161,7 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     include_normals = True
 
   train_dataset = RescueNetDataset(
-    data_dir='/dev/shm/data/RescueNet/RescueNet/train',
+    data_dir='/dev/shm/data/RescueNet/train',
     include_depth=include_depth,
     include_normals=include_normals,
     spatial_transform=spatial_aug,
@@ -169,7 +169,7 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     training=True
   )
   val_dataset = RescueNetDataset(
-    data_dir='/dev/shm/data/RescueNet/RescueNet/val',
+    data_dir='/dev/shm/data/RescueNet/val',
     include_depth=include_depth,
     include_normals=include_normals
   )
