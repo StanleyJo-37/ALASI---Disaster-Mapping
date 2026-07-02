@@ -17,12 +17,12 @@ class UncertaintyLossWeighting(torch.nn.Module):
     loss_depth: Optional[torch.Tensor] = None,
     loss_normal: Optional[torch.Tensor] = None
   ):
-    loss_total = torch.exp(-self.alpha) * loss_seg + self.alpha
+    loss_total = torch.exp(-self.alpha) * loss_seg + (self.alpha * 0.5)
     
     if loss_depth is not None:
-      loss_total = loss_total + (torch.exp(-self.beta) * loss_depth) + self.beta
+      loss_total = loss_total + 0.5 * ((torch.exp(-self.beta) * loss_depth) + self.beta)
     
     if loss_normal is not None:
-      loss_total = loss_total + (torch.exp(-self.gamma) * loss_normal) + self.gamma
+      loss_total = loss_total + 0.5 * ((torch.exp(-self.gamma) * loss_normal) + self.gamma)
     
     return loss_total
