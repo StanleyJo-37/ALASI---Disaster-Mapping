@@ -255,7 +255,7 @@ for model_type in [
   seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
   depth_loss_criterion = SSILoss()
 
-  early_stopping = EarlyStoppingAndCheckpointing(patience=10, delta=0.01)
+  early_stopping = EarlyStoppingAndCheckpointing(patience=10, delta=0.01, save_per_epoch=5)
 
   train_loader = dataset_and_loader['train'][1]
   val_loader = dataset_and_loader['val'][1]
@@ -443,15 +443,20 @@ for model_type in [
       f"============================================\n"
       f"---TRAINING---\n"
       f"- Total Loss: {avg_train_loss:.4f}\n"
-      f"- Seg: {avg_train_seg_loss:.4f}\n"
-      f"- Depth: {avg_train_depth_loss:.4f}\n"
-      f"- Norm: {avg_train_normal_loss:.4f}\n"
+      f"- Seg | Weighted: {avg_train_seg_loss:.4f} | {avg_weighted_train_seg_loss:.4f}\n"
+      f"- Depth | Weighted: {avg_train_depth_loss:.4f} | {avg_weighted_train_depth_loss:.4f}\n"
+      f"- Norm | Weighted: {avg_train_normal_loss:.4f} | {avg_weighted_train_normal_loss:.4f}\n"
       f"============================================\n"
       f"---VALIDATION---\n"
       f"- Total Loss: {avg_val_loss:.4f}\n"
-      f"- Seg: {avg_val_seg_loss:.4f}\n"
-      f"- Depth: {avg_val_depth_loss:.4f}\n"
-      f"- Norm: {avg_val_normal_loss:.4f}\n"
+      f"- Seg | Weighted: {avg_val_seg_loss:.4f} | {avg_weighted_val_seg_loss}\n"
+      f"- Depth | Weighted: {avg_val_depth_loss:.4f} | {avg_weighted_val_depth_loss}\n"
+      f"- Norm | Weighted: {avg_val_normal_loss:.4f} | {avg_weighted_val_normal_loss}\n"
+      f"============================================\n"
+      f"---PENALTY TERMS---"
+      f"Segmentation Penalty Term: {loss_balancer.alpha}"
+      f"Depth Penalty Term: {loss_balancer.beta}"
+      f"Surface Normal Penalty Term: {loss_balancer.gamma}"
     )
 
     if halt:
