@@ -454,9 +454,9 @@ for model_type in [
       f"- Norm | Weighted: {avg_val_normal_loss:.4f} | {avg_weighted_val_normal_loss}\n"
       f"============================================\n"
       f"---PENALTY TERMS---"
-      f"Segmentation Penalty Term: {loss_balancer.alpha}"
-      f"Depth Penalty Term: {loss_balancer.beta}"
-      f"Surface Normal Penalty Term: {loss_balancer.gamma}"
+      f"Segmentation Penalty Term: {loss_balancer.alpha.item()}"
+      f"Depth Penalty Term: {loss_balancer.beta.item()}"
+      f"Surface Normal Penalty Term: {loss_balancer.gamma.item()}"
     )
 
     if halt:
