@@ -103,7 +103,7 @@ def infuse_args(model: TriheadSegmentationModel):
 
   if 'overlap_mask' not in current_args:
     current_args['overlap_mask'] = True
-  current_args['nc'] = 11
+  current_args['nc'] = 12
 
   model.yolo_backbone.args = SimpleNamespace(**current_args)
 
