@@ -220,8 +220,8 @@ TOTAL_WARMUP_STEPS = 2
 
 print('Start training - ablation study')
 for model_type in [
-  'additional-both',
   'vanilla',
+  'additional-both',
   'additional-normal',
   'additional-depth'
 ]:
@@ -458,10 +458,10 @@ for model_type in [
       f"- Depth | Weighted: {avg_val_depth_loss:.4f} | {avg_weighted_val_depth_loss}\n"
       f"- Norm | Weighted: {avg_val_normal_loss:.4f} | {avg_weighted_val_normal_loss}\n"
       f"============================================\n"
-      f"---PENALTY TERMS---"
-      f"Segmentation Penalty Term: {loss_balancer.alpha.item()}"
-      f"Depth Penalty Term: {loss_balancer.beta.item()}"
-      f"Surface Normal Penalty Term: {loss_balancer.gamma.item()}"
+      f"---PENALTY TERMS---\n"
+      f"Segmentation Penalty Term: {loss_balancer.alpha.item()}\n"
+      f"Depth Penalty Term: {loss_balancer.beta.item()}\n"
+      f"Surface Normal Penalty Term: {loss_balancer.gamma.item()}\n"
     )
 
     if halt:
@@ -510,14 +510,14 @@ for model_type in [
       ])
   print(f"Saved training history to {csv_filename}")
 
-  upload_folder_to_huggingface(
-    'weights',
-    'weights'
-  )
-  upload_folder_to_huggingface(
-    'eval_results',
-    'eval_results'
-  )
+  # upload_folder_to_huggingface(
+  #   'weights',
+  #   'weights'
+  # )
+  # upload_folder_to_huggingface(
+  #   'eval_results',
+  #   'eval_results'
+  # )
   
   # Cleanup
   del final_model, loss_balancer, optimizer, scheduler, train_loader, val_loader, dataset_and_loader
