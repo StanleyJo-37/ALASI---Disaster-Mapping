@@ -40,9 +40,21 @@ class TriheadSegmentationModel(torch.nn.Module):
     self.include_depth = include_depth
     self.include_normals = include_normals
     
-    yolo_wrapper = YOLO(model=yolo_pt_path, verbose=verbose)
-    
+    yolo_wrapper = YOLO(model=yolo_pt_path, verbose=verbose, )
     self.yolo_backbone = yolo_wrapper.model.to(device)
+    
+    head = self.yolo_backbone.model[-1]
+    
+    new_clf = torch.nn.Conv2d(256, 12, kernel_size=1, bias=True).to(device)
+    self._init_segmentation_head(new_clf)
+    head.classifier[-1] = new_clf
+    
+    new_aux = torch.nn.Conv2d(256, 12, kernel_size=1, bias=True).to(device)
+    self._init_segmentation_head(new_aux)
+    head.aux_head[-1] = new_aux
+    
+    head.nc = 12
+    self.yolo_backbone.nc = 12
     
     if self.include_depth or self.include_normals:
       def intercept_feature_map(_module, _input, output, store_idx):
@@ -65,6 +77,11 @@ class TriheadSegmentationModel(torch.nn.Module):
   
   def project_point_cloud_to_2d(self) -> np.ndarray:
     return np.array([])
+  
+  def _init_segmentation_head(self, layer: torch.nn.Module):
+    torch.nn.init.normal_(layer.weight, mean=0.0, std=0.01)
+    if layer.bias is not None:
+      torch.nn.init.zeros_(layer.bias)
   
   def forward(self, X: torch.Tensor, *args, **kwds):
     segmentation_map = self.yolo_backbone._predict_once(X)

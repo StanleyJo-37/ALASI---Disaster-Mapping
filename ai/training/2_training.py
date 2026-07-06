@@ -90,6 +90,11 @@ def create_peft_model(model: TriheadSegmentationModel):
   )
   
   peft_backbone = get_peft_model(model.yolo_backbone, peft_config=lora_config).to(device)
+  
+  for name, param in peft_backbone.named_parameters():
+    if 'model.17' in name:
+      param.requires_grad = True
+  
   peft_backbone.print_trainable_parameters()
   peft_backbone.to(device)
 
