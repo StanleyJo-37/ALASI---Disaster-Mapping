@@ -528,6 +528,7 @@ for model_type in [
     alloc_before = torch.cuda.memory_allocated() / (1024 ** 3)
     res_before = torch.cuda.memory_reserved() / (1024 ** 3)
 
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
 
