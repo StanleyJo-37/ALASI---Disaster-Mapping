@@ -10,14 +10,14 @@ class DecoderHead(nn.Module):
     
     self.target_size = target_size
     
-    self.decoder_block_1 = self.create_decoder_block(512, 256, 384) # in: 512, 20, 20 -> out: 256, 40, 40
-    self.decoder_block_2 = self.create_decoder_block(768, 256, 512) # in: 256, 40, 40 concat (512, 40, 40) -> 768, 40, 40 -> out: 256, 80, 80
-    self.decoder_block_3 = self.create_decoder_block(768, 256, 512) # in: 256, 80, 80 concat (512, 80, 80) -> 768, 80, 80 -> out: 256, 160, 160
-    self.decoder_block_4 = self.create_decoder_block(256, 128) # in: 256, 160, 160 -> out: 128, 320, 320
+    self.decoder_block_1 = self.create_decoder_block(512, 256, 32, 384) # in: 512, 20, 20 -> out: 256, 40, 40
+    self.decoder_block_2 = self.create_decoder_block(768, 256, 32, 512) # in: 256, 40, 40 concat (512, 40, 40) -> 768, 40, 40 -> out: 256, 80, 80
+    self.decoder_block_3 = self.create_decoder_block(768, 256, 32, 512) # in: 256, 80, 80 concat (512, 80, 80) -> 768, 80, 80 -> out: 256, 160, 160
+    self.decoder_block_4 = self.create_decoder_block(256, 128, 32) # in: 256, 160, 160 -> out: 128, 320, 320
     self.output_block = nn.Sequential(
-      self.create_output_block(128, 64, 3, 1), # 64, 320, 320
-      self.create_output_block(64, 32, 3, 1), # 32, 320, 320
-      self.create_output_block(32, 16, 3, 1, dropout_out=0.0), # 16, 320, 320
+      self.create_output_block(128, 64, 32, 3, 1), # 64, 320, 320
+      self.create_output_block(64, 32, 32, 3, 1), # 32, 320, 320
+      self.create_output_block(32, 16, 8, 3, 1, dropout_out=0.0), # 16, 320, 320
       
       nn.Conv2d(16, out_channels, kernel_size=1) # out, 320, 320
     )
@@ -26,13 +26,14 @@ class DecoderHead(nn.Module):
     self,
     in_channel: int,
     out_channel: int,
+    num_groups: int,
     kernel_size: int | tuple[int, int],
     padding: int | tuple[int, int],
     dropout_out: float = 0.1
   ):
     return nn.Sequential(
       nn.Conv2d(in_channel, out_channel, kernel_size=kernel_size, padding=padding, bias=False),
-      nn.BatchNorm2d(out_channel),
+      nn.GroupNorm(num_channels=out_channel, num_groups=num_groups),
       nn.SiLU(inplace=True),
       
       nn.Dropout2d(dropout_out),
@@ -54,6 +55,7 @@ class DecoderHead(nn.Module):
     self,
     in_channels: int,
     out_channels: int,
+    num_groups: int,
     mid_channels: Optional[int] = None,
   ) -> nn.Module:
     if not mid_channels:
@@ -68,11 +70,11 @@ class DecoderHead(nn.Module):
       nn.SiLU(inplace=True),
       
       nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-      nn.BatchNorm2d(mid_channels),
+      nn.GroupNorm(num_channels=mid_channels, num_groups=num_groups),
       nn.SiLU(inplace=True),
       
       nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-      nn.BatchNorm2d(out_channels),
+      nn.GroupNorm(num_channels=out_channels, num_groups=num_groups),
       nn.SiLU(inplace=True),
       nn.Dropout2d(0.2),
     )

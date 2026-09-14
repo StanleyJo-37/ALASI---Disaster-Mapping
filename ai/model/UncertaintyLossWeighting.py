@@ -18,15 +18,18 @@ class UncertaintyLossWeighting(torch.nn.Module):
     loss_normal: Optional[torch.Tensor] = None
   ):
     # Weighted Semantic Segmentation Loss
-    loss_total = torch.exp(-self.alpha) * loss_seg + (self.alpha * 0.5)
+    weighted_seg_loss = torch.exp(-self.alpha) * loss_seg + (self.alpha * 0.5)
+    loss_total = weighted_seg_loss
     
     # Weighted Depth Loss
     if loss_depth is not None:
-      loss_total = loss_total + 0.5 * ((torch.exp(-self.beta) * loss_depth) + self.beta)
+      weighted_depth_loss = 0.5 * ((torch.exp(-self.beta) * loss_depth) + self.beta)
+      loss_total = loss_total + weighted_depth_loss
     
     # Weighted Normal Loss
     if loss_normal is not None:
-      loss_total = loss_total + 0.5 * ((torch.exp(-self.gamma) * loss_normal) + self.gamma)
+      weighted_normal_loss = 0.5 * ((torch.exp(-self.gamma) * loss_normal) + self.gamma)
+      loss_total = loss_total + weighted_normal_loss
     
     # Returns the Sum of Weighted Loss
-    return loss_total
+    return loss_total, weighted_seg_loss, weighted_depth_loss, weighted_normal_loss

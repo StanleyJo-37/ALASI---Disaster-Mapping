@@ -45,16 +45,20 @@ class TriheadSegmentationModel(torch.nn.Module):
     
     head = self.yolo_backbone.model[-1]
     
-    new_clf = torch.nn.Conv2d(256, 12, kernel_size=1, bias=True).to(device)
+    new_clf = torch.nn.Conv2d(256, 11, kernel_size=1, bias=True).to(device)
     self._init_segmentation_head(new_clf)
     head.classifier[-1] = new_clf
     
-    new_aux = torch.nn.Conv2d(256, 12, kernel_size=1, bias=True).to(device)
+    new_aux = torch.nn.Conv2d(256, 11, kernel_size=1, bias=True).to(device)
     self._init_segmentation_head(new_aux)
     head.aux_head[-1] = new_aux
     
-    head.nc = 12
-    self.yolo_backbone.nc = 12
+    head.nc = 11
+    self.yolo_backbone.nc = 11
+    
+    for module in self.yolo_backbone.modules():
+      if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+        module.eval()
     
     if self.include_depth or self.include_normals:
       def intercept_feature_map(_module, _input, output, store_idx):

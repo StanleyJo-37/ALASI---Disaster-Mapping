@@ -30,6 +30,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.amp import autocast
 from huggingface_hub import snapshot_download
 import cv2
+import numpy as np
 
 from datasets.rescuenet_dataset import RescueNetDataset, collate_fn
 from utils.augmentations import get_augmentation_pipeline
@@ -40,16 +41,32 @@ from custom_types.training import AblationStudyType
 from utils.runpod import end_session
 from utils.storage import upload_folder_to_huggingface
 
-
-
 print('Loading variables..')
 load_dotenv()
 MODEL_WEIGHT_DIR = 'model/weights'
-TRAIN_BATCH_SIZE = 8
-VAL_BATCH_SIZE = 8
+BACKGROUND_CLASS = 0
+TRAIN_BATCH_SIZE = 4
+VAL_BATCH_SIZE = 4
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_name)
 print(f'Device used: {device}')
+CLASS_WEIGHTS = torch.tensor([
+  0.14733338,
+  0.39315039,
+  0.66941495,
+  0.65486371,
+  0.82150387,
+  0.88164306,
+  1.84860004,
+  0.40923846,
+  0.85621029,
+  0.23214045,
+  4.0859014
+], device=device)
+rng = np.random.default_rng(13)
 
 print('Downloading dataset..')
 # os.makedirs('./data', exist_ok=True)
@@ -62,13 +79,20 @@ print('Downloading dataset..')
 
 print('Defining functions..')
 
-cv2.setNumThreads(0)
-cv2.ocl.setUseOpenCL(False)
+# cv2.setNumThreads(0)
+# cv2.ocl.setUseOpenCL(False)
 
 def set_training_mode(model: torch.nn.Module, mode: bool = True):
-  for m in model.modules():
-    m.training = mode
-  return model
+    """Sets mode, but ensures backbone BatchNorms stay frozen."""
+    for m in model.modules():
+      m.training = mode
+        
+    if hasattr(model, 'yolo_backbone'):
+      for m in model.yolo_backbone.modules():
+        if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+          m.eval()
+                
+    return model
 
 def create_peft_model(model: TriheadSegmentationModel):
   valid_target_modules = []
@@ -82,9 +106,9 @@ def create_peft_model(model: TriheadSegmentationModel):
         valid_target_modules.append(full_name)
 
   lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    lora_dropout=0.05,
+    r=4,
+    lora_alpha=8,
+    lora_dropout=0.1,
     target_modules=valid_target_modules,
     bias="none",
   )
@@ -92,6 +116,9 @@ def create_peft_model(model: TriheadSegmentationModel):
   peft_backbone = get_peft_model(model.yolo_backbone, peft_config=lora_config).to(device)
   
   for name, param in peft_backbone.named_parameters():
+    # if 'model.17.classifier.1' in name or 'model.17.aux_head.1' in name:
+    #   param.requires_grad = True
+    # elif 'model.17' in name:
     if 'model.17' in name:
       param.requires_grad = True
   
@@ -105,11 +132,7 @@ def create_peft_model(model: TriheadSegmentationModel):
 
 def infuse_args(model: TriheadSegmentationModel):
   current_args = model.yolo_backbone.args if isinstance(model.yolo_backbone.args, dict) else {}
-
-  if 'overlap_mask' not in current_args:
-    current_args['overlap_mask'] = True
-  current_args['nc'] = 12
-
+  current_args['nc'] = 11
   model.yolo_backbone.args = SimpleNamespace(**current_args)
 
 def get_model(model_type: AblationStudyType):
@@ -165,28 +188,42 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     include_depth = True
     include_normals = True
 
+  from torch.utils.data.dataset import Subset
   train_dataset = RescueNetDataset(
-    data_dir='/dev/shm/data/RescueNet/train',
+    data_dir='data/RescueNet/train',
     include_depth=include_depth,
     include_normals=include_normals,
     spatial_transform=spatial_aug,
     photometric_transform=photometric_aug,
     training=True
   )
+  subset_size = len(train_dataset) // 4
+  indices = rng.choice(len(train_dataset), size=subset_size, replace=False)
+  train_dataset = Subset(train_dataset, indices)
+  class_pixel_counts = np.zeros(12)
+  for idx in indices:
+      label_path = train_dataset.dataset.label_paths[idx]  # .dataset since it's wrapped in Subset
+      label = np.load(label_path).squeeze()
+      for c in range(12):
+          class_pixel_counts[c] += (label == c).sum()
+
+  print(class_pixel_counts)
   val_dataset = RescueNetDataset(
-    data_dir='/dev/shm/data/RescueNet/val',
+    data_dir='data/RescueNet/val',
     include_depth=include_depth,
     include_normals=include_normals
   )
+  val_dataset = Subset(val_dataset, list(range(128)))
 
   train_loader = torch.utils.data.DataLoader(
     train_dataset,
     batch_size=TRAIN_BATCH_SIZE,
     shuffle=True,
     collate_fn=collate_fn,
-    num_workers=8,
-    pin_memory=True,
-    prefetch_factor=2
+    # persistent_workers=True,
+    # num_workers=8,
+    # pin_memory=True,
+    # prefetch_factor=2
   )
   
   val_loader = torch.utils.data.DataLoader(
@@ -194,9 +231,10 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     batch_size=VAL_BATCH_SIZE,
     shuffle=False,
     collate_fn=collate_fn,
-    num_workers=4,
-    pin_memory=True,
-    prefetch_factor=2
+    # persistent_workers=True,
+    # num_workers=4,
+    # pin_memory=True,
+    # prefetch_factor=2
   )
 
   return {
@@ -214,19 +252,19 @@ def get_depth_and_normals_inclusion(model_type: AblationStudyType) -> tuple[bool
   elif model_type == 'additional-both':
     return True, True
 
-TOTAL_EPOCHS = 50
+TOTAL_EPOCHS = 5
 TOTAL_STATIC_STEPS = 3
 TOTAL_WARMUP_STEPS = 2
 
 print('Start training - ablation study')
 for model_type in [
-  'vanilla',
+  # 'vanilla',
   'additional-both',
-  'additional-normal',
-  'additional-depth'
+  # 'additional-normal',
+  # 'additional-depth'
 ]:
-  raw_yolo_architecture, final_model, loss_balancer = get_model(model_type)
   dataset_and_loader = get_dataset_and_loader(model_type)
+  raw_yolo_architecture, final_model, loss_balancer = get_model(model_type)  
   include_depth, include_normals = get_depth_and_normals_inclusion(model_type)
 
   trainable_params = [p for p in final_model.parameters() if p.requires_grad]
@@ -235,7 +273,7 @@ for model_type in [
   optimizer = AdamW(
     trainable_params,
     lr=2e-4,
-    weight_decay=1e-2
+    weight_decay=5e-2
   )
   
   warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -258,9 +296,10 @@ for model_type in [
   )
 
   seg_loss_criterion = SemanticSegmentationLoss(raw_yolo_architecture)
+  seg_loss_criterion.ce = torch.nn.CrossEntropyLoss(weight=CLASS_WEIGHTS)
   depth_loss_criterion = SSILoss()
 
-  early_stopping = EarlyStoppingAndCheckpointing(patience=10, delta=0.01, save_per_epoch=5)
+  early_stopping = EarlyStoppingAndCheckpointing(patience=5, delta=0.01, save_per_epoch=1)
 
   train_loader = dataset_and_loader['train'][1]
   val_loader = dataset_and_loader['val'][1]
@@ -270,18 +309,19 @@ for model_type in [
   val_loss_history = []
 
   for epoch in range(1, TOTAL_EPOCHS + 1):
-    epoch_train_loss = 0.0 
-    epoch_train_seg_loss = 0.0
-    epoch_weighted_train_seg_loss = 0.0
-    epoch_train_depth_loss = 0.0
-    epoch_weighted_train_depth_loss = 0.0
-    epoch_train_normal_loss = 0.0
-    epoch_weighted_train_normal_loss = 0.0
+    epoch_train_loss = torch.zeros((), device=device) 
+    epoch_train_seg_loss = torch.zeros((), device=device)
+    epoch_weighted_train_seg_loss = torch.zeros((), device=device)
+    epoch_train_depth_loss = torch.zeros((), device=device)
+    epoch_weighted_train_depth_loss = torch.zeros((), device=device)
+    epoch_train_normal_loss = torch.zeros((), device=device)
+    epoch_weighted_train_normal_loss = torch.zeros((), device=device)
 
     set_training_mode(final_model, True)
+    final_model.yolo_backbone.train()
     
     for batch_idx, (batch_images, batch_targets) in enumerate(train_loader, 1):
-      optimizer.zero_grad()
+      optimizer.zero_grad(set_to_none=True)
 
       with autocast(device_type=device_name, dtype=torch.bfloat16):
         segmentation_out, depth_out, normal_out = final_model(batch_images.to(device=device))
@@ -306,32 +346,22 @@ for model_type in [
         if model_type == 'vanilla':
           loss_total = seg_loss
         else:
-          loss_total = loss_balancer(
+          loss_total, weighted_seg_loss, weighted_depth_loss, weighted_normal_loss = loss_balancer(
             seg_loss,
             depth_loss if include_depth else None,
             normal_loss if include_normals else None
-          )
-          
-          weighted_seg_loss = torch.exp(-loss_balancer.alpha) * seg_loss + loss_balancer.alpha
-          weighted_depth_loss = (
-            torch.exp(-loss_balancer.beta) * depth_loss + loss_balancer.beta
-            if include_depth else torch.tensor(0.0, device=device)
-          )
-          weighted_normal_loss = (
-            torch.exp(-loss_balancer.gamma) * normal_loss + loss_balancer.gamma
-            if include_normals else torch.tensor(0.0, device=device)
           )
 
       loss_total.backward()
       optimizer.step()
 
-      epoch_train_loss += loss_total.item()
-      epoch_train_seg_loss += seg_loss.mean().item()
-      epoch_weighted_train_seg_loss += weighted_seg_loss.mean().item()
-      epoch_train_depth_loss += depth_loss.mean().item()
-      epoch_weighted_train_depth_loss += weighted_depth_loss.mean().item()
-      epoch_train_normal_loss += normal_loss.mean().item()
-      epoch_weighted_train_normal_loss += weighted_normal_loss.mean().item()
+      epoch_train_loss += loss_total.mean().detach()
+      epoch_train_seg_loss += seg_loss.mean().detach()
+      epoch_weighted_train_seg_loss += weighted_seg_loss.mean().detach()
+      epoch_train_depth_loss += depth_loss.mean().detach()
+      epoch_weighted_train_depth_loss += weighted_depth_loss.mean().detach()
+      epoch_train_normal_loss += normal_loss.mean().detach()
+      epoch_weighted_train_normal_loss += weighted_normal_loss.mean().detach()
 
       print(
         f"Epoch [{epoch:03d}/{TOTAL_EPOCHS:03d}] Batch [{batch_idx:04d}/{len(train_loader):04d}] | "
@@ -340,24 +370,26 @@ for model_type in [
       )
 
     scheduler.step()
+    torch.cuda.empty_cache()
 
-    avg_train_loss = epoch_train_loss / len(train_loader)
-    avg_train_seg_loss = epoch_train_seg_loss / len(train_loader)
-    avg_weighted_train_seg_loss = epoch_weighted_train_seg_loss / len(train_loader)
-    avg_train_depth_loss = epoch_train_depth_loss / len(train_loader)
-    avg_weighted_train_depth_loss = epoch_weighted_train_depth_loss / len(train_loader)
-    avg_train_normal_loss = epoch_train_normal_loss / len(train_loader)
-    avg_weighted_train_normal_loss = epoch_weighted_train_normal_loss / len(train_loader)
+    avg_train_loss = (epoch_train_loss / len(train_loader)).item()
+    avg_train_seg_loss = (epoch_train_seg_loss / len(train_loader)).item()
+    avg_weighted_train_seg_loss = (epoch_weighted_train_seg_loss / len(train_loader)).item()
+    avg_train_depth_loss = (epoch_train_depth_loss / len(train_loader)).item()
+    avg_weighted_train_depth_loss = (epoch_weighted_train_depth_loss / len(train_loader)).item()
+    avg_train_normal_loss = (epoch_train_normal_loss / len(train_loader)).item()
+    avg_weighted_train_normal_loss = (epoch_weighted_train_normal_loss / len(train_loader)).item()
 
-    epoch_val_loss = 0.0
-    epoch_val_seg_loss = 0.0
-    epoch_weighted_val_seg_loss = 0.0
-    epoch_val_depth_loss = 0.0
-    epoch_weighted_val_depth_loss = 0.0
-    epoch_val_normal_loss = 0.0
-    epoch_weighted_val_normal_loss = 0.0
+    epoch_val_loss = torch.zeros((), device=device)
+    epoch_val_seg_loss = torch.zeros((), device=device)
+    epoch_weighted_val_seg_loss = torch.zeros((), device=device)
+    epoch_val_depth_loss = torch.zeros((), device=device)
+    epoch_weighted_val_depth_loss = torch.zeros((), device=device)
+    epoch_val_normal_loss = torch.zeros((), device=device)
+    epoch_weighted_val_normal_loss = torch.zeros((), device=device)
 
     set_training_mode(final_model, False)
+    final_model.yolo_backbone.eval()
     with torch.no_grad():
       for batch_images_val, batch_targets_val in val_loader:
         with autocast(device_type=device_name, dtype=torch.bfloat16):
@@ -383,37 +415,27 @@ for model_type in [
           if model_type == 'vanilla':
             val_loss_total = seg_loss
           else:
-            val_loss_total = loss_balancer(
+            val_loss_total, weighted_seg_loss, weighted_depth_loss, weighted_normal_loss = loss_balancer(
               seg_loss,
               depth_loss if include_depth else None,
               normal_loss if include_normals else None
             )
-            
-            weighted_seg_loss = torch.exp(-loss_balancer.alpha) * seg_loss + loss_balancer.alpha
-            weighted_depth_loss = (
-              torch.exp(-loss_balancer.beta) * depth_loss + loss_balancer.beta
-              if include_depth else torch.tensor(0.0, device=device)
-            )
-            weighted_normal_loss = (
-              torch.exp(-loss_balancer.gamma) * normal_loss + loss_balancer.gamma
-              if include_normals else torch.tensor(0.0, device=device)
-            )
 
-          epoch_val_loss += val_loss_total.mean().item()
-          epoch_val_seg_loss += seg_loss.mean().item()
-          epoch_weighted_val_seg_loss += weighted_seg_loss.mean().item()
-          epoch_val_depth_loss += depth_loss.mean().item()
-          epoch_weighted_val_depth_loss += weighted_depth_loss.mean().item()
-          epoch_val_normal_loss += normal_loss.mean().item()
-          epoch_weighted_val_normal_loss += weighted_normal_loss.mean().item()
+          epoch_val_loss += val_loss_total.mean().detach()
+          epoch_val_seg_loss += seg_loss.mean().detach()
+          epoch_weighted_val_seg_loss += weighted_seg_loss.mean().detach()
+          epoch_val_depth_loss += depth_loss.mean().detach()
+          epoch_weighted_val_depth_loss += weighted_depth_loss.mean().detach()
+          epoch_val_normal_loss += normal_loss.mean().detach()
+          epoch_weighted_val_normal_loss += weighted_normal_loss.mean().detach()
 
-    avg_val_loss = epoch_val_loss / len(val_loader)
-    avg_val_seg_loss = epoch_val_seg_loss / len(val_loader)
-    avg_weighted_val_seg_loss = epoch_weighted_val_seg_loss / len(val_loader)
-    avg_val_depth_loss = epoch_val_depth_loss / len(val_loader)
-    avg_weighted_val_depth_loss = epoch_weighted_val_depth_loss / len(val_loader)
-    avg_val_normal_loss = epoch_val_normal_loss / len(val_loader)
-    avg_weighted_val_normal_loss = epoch_weighted_val_normal_loss / len(val_loader)
+    avg_val_loss = (epoch_val_loss / len(val_loader)).item()
+    avg_val_seg_loss = (epoch_val_seg_loss / len(val_loader)).item()
+    avg_weighted_val_seg_loss = (epoch_weighted_val_seg_loss / len(val_loader)).item()
+    avg_val_depth_loss = (epoch_val_depth_loss / len(val_loader)).item()
+    avg_weighted_val_depth_loss = (epoch_weighted_val_depth_loss / len(val_loader)).item()
+    avg_val_normal_loss = (epoch_val_normal_loss / len(val_loader)).item()
+    avg_weighted_val_normal_loss = (epoch_weighted_val_normal_loss / len(val_loader)).item()
 
     # Record the metrics
     epoch_history.append(epoch)
@@ -454,14 +476,14 @@ for model_type in [
       f"============================================\n"
       f"---VALIDATION---\n"
       f"- Total Loss: {avg_val_loss:.4f}\n"
-      f"- Seg | Weighted: {avg_val_seg_loss:.4f} | {avg_weighted_val_seg_loss}\n"
-      f"- Depth | Weighted: {avg_val_depth_loss:.4f} | {avg_weighted_val_depth_loss}\n"
-      f"- Norm | Weighted: {avg_val_normal_loss:.4f} | {avg_weighted_val_normal_loss}\n"
+      f"- Seg | Weighted: {avg_val_seg_loss:.4f} | {avg_weighted_val_seg_loss:.4f}\n"
+      f"- Depth | Weighted: {avg_val_depth_loss:.4f} | {avg_weighted_val_depth_loss:.4f}\n"
+      f"- Norm | Weighted: {avg_val_normal_loss:.4f} | {avg_weighted_val_normal_loss:.4f}\n"
       f"============================================\n"
       f"---PENALTY TERMS---\n"
-      f"Segmentation Penalty Term: {loss_balancer.alpha.item()}\n"
-      f"Depth Penalty Term: {loss_balancer.beta.item()}\n"
-      f"Surface Normal Penalty Term: {loss_balancer.gamma.item()}\n"
+      f"Segmentation Penalty Term: {loss_balancer.alpha.item():.4f}\n"
+      f"Depth Penalty Term: {loss_balancer.beta.item():.4f}\n"
+      f"Surface Normal Penalty Term: {loss_balancer.gamma.item():.4f}\n"
     )
 
     if halt:
