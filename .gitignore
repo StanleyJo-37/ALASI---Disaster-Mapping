@@ -1,5 +1,4 @@
-depth_anything_3
-DSINE
+AerialMetric
 
 output/depth_vis
 *.pt
