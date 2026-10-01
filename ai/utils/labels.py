@@ -51,3 +51,6 @@ def create_binary_mask(coords: List[np.ndarray], dims: Tuple[int, int] = (640, 6
   binary_mask_tensor = torch.from_numpy(binary_mask).float()
   
   return binary_mask_tensor
+
+def generate_surface_normals(depth_map: np.array) -> np.array:
+  return np.array([])
