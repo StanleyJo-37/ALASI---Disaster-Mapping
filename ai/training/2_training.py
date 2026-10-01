@@ -1,22 +1,20 @@
 import os
 import sys
+from pathlib import Path
 
-ROOT_PATH = '../'
-os.chdir(ROOT_PATH)
+SCRIPT_DIR = Path(__file__).resolve().parent   # .../ai/training
+AI_DIR = SCRIPT_DIR.parent                     # .../ai
+PROJECT_DIR = AI_DIR.parent                    # .../vision-ai-development
+LIB_DIR = AI_DIR / 'lib'
 
-sys.path.append(os.path.abspath(ROOT_PATH))
-
-AI_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(AI_DIR)
 
-if AI_DIR not in sys.path:
-  sys.path.append(AI_DIR)
-
-lib_path = os.path.abspath(os.path.join(ROOT_PATH, 'lib'))
-if lib_path not in sys.path:
-  sys.path.append(lib_path)
+for p in (AI_DIR, PROJECT_DIR, LIB_DIR):
+  if str(p) not in sys.path:
+    sys.path.append(str(p))
 
 print('Importing Dependencies..')
+
 from types import SimpleNamespace
 import gc
 import csv
@@ -26,10 +24,10 @@ import torch
 from peft import LoraConfig, get_peft_model
 from ultralytics.utils.loss import SemanticSegmentationLoss
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
 from torch.amp import autocast
+from torch.utils.data import DataLoader, Subset
 from huggingface_hub import snapshot_download
-import cv2
 import numpy as np
 
 from datasets.rescuenet_dataset import RescueNetDataset, collate_fn
@@ -42,17 +40,33 @@ from utils.runpod import end_session
 from utils.storage import upload_folder_to_huggingface
 
 print('Loading variables..')
+
 load_dotenv()
+
 MODEL_WEIGHT_DIR = 'model/weights'
+YOLO_WEIGHTS = f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt'
 BACKGROUND_CLASS = 0
+NUM_CLASSES = 11
+
 TRAIN_BATCH_SIZE = 4
 VAL_BATCH_SIZE = 4
+TRAIN_SUBSET_FRACTION = 4
+VAL_SUBSET_SIZE = 128
+
+TOTAL_EPOCHS = 5
+TOTAL_WARMUP_STEPS = 2
+TOTAL_STATIC_STEPS = 3
+
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+# cv2.setNumThreads(0)
+# cv2.ocl.setUseOpenCL(False)
+
 device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = torch.device(device_name)
 print(f'Device used: {device}')
+
 CLASS_WEIGHTS = torch.tensor([
   0.14733338,
   0.39315039,
@@ -66,9 +80,12 @@ CLASS_WEIGHTS = torch.tensor([
   0.23214045,
   4.0859014
 ], device=device)
+assert CLASS_WEIGHTS.numel() == NUM_CLASSES
+
 rng = np.random.default_rng(13)
 
 print('Downloading dataset..')
+
 # os.makedirs('./data', exist_ok=True)
 # snapshot_download(
 #   repo_id=os.environ.get('HF_DATASET_REPO_ID'),
@@ -79,13 +96,16 @@ print('Downloading dataset..')
 
 print('Defining functions..')
 
-# cv2.setNumThreads(0)
-# cv2.ocl.setUseOpenCL(False)
+TASK_CONFIG: dict[str, tuple[bool, bool]] = {
+  'vanilla':           (False, False),
+  'additional-depth':  (True,  False),
+  'additional-normal': (False, True),
+  'additional-both':   (True,  True),
+}
 
 def set_training_mode(model: torch.nn.Module, mode: bool = True):
     """Sets mode, but ensures backbone BatchNorms stay frozen."""
-    for m in model.modules():
-      m.training = mode
+    model.train(mode)
         
     if hasattr(model, 'yolo_backbone'):
       for m in model.yolo_backbone.modules():
@@ -104,7 +124,7 @@ def create_peft_model(model: TriheadSegmentationModel):
       if isinstance(module, torch.nn.Conv2d) and module.groups == 1:
         full_name = f"model.{layer_idx}.{name}" if name else f"model.{layer_idx}"
         valid_target_modules.append(full_name)
-
+  
   lora_config = LoraConfig(
     r=4,
     lora_alpha=8,
@@ -112,13 +132,10 @@ def create_peft_model(model: TriheadSegmentationModel):
     target_modules=valid_target_modules,
     bias="none",
   )
-  
+
   peft_backbone = get_peft_model(model.yolo_backbone, peft_config=lora_config).to(device)
-  
+
   for name, param in peft_backbone.named_parameters():
-    # if 'model.17.classifier.1' in name or 'model.17.aux_head.1' in name:
-    #   param.requires_grad = True
-    # elif 'model.17' in name:
     if 'model.17' in name:
       param.requires_grad = True
   
@@ -126,44 +143,22 @@ def create_peft_model(model: TriheadSegmentationModel):
   peft_backbone.to(device)
 
   model.yolo_backbone = peft_backbone
-  final_model = model.to(device)
-
-  return final_model
+  return model.to(device)
 
 def infuse_args(model: TriheadSegmentationModel):
   current_args = model.yolo_backbone.args if isinstance(model.yolo_backbone.args, dict) else {}
-  current_args['nc'] = 11
+  current_args['nc'] = NUM_CLASSES
   model.yolo_backbone.args = SimpleNamespace(**current_args)
 
 def get_model(model_type: AblationStudyType):
-  if model_type == 'vanilla':
-    model = TriheadSegmentationModel(
-      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt',
-      include_depth=False,
-      include_normals=False,
-      device=device
-    )
-  elif model_type == 'additional-depth':
-    model = TriheadSegmentationModel(
-      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt',
-      include_depth=True,
-      include_normals=False,
-      device=device
-    )
-  elif model_type == 'additional-normal':
-    model = TriheadSegmentationModel(
-      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt',
-      include_depth=False,
-      include_normals=True,
-      device=device
-    )
-  elif model_type == 'additional-both':
-    model = TriheadSegmentationModel(
-      yolo_pt_path=f'{MODEL_WEIGHT_DIR}/yolo26m-sem.pt',
-      include_depth=True,
-      include_normals=True,
-      device=device
-    )
+  include_depth, include_normals = TASK_CONFIG[model_type]
+
+  model = TriheadSegmentationModel(
+    yolo_pt_path=YOLO_WEIGHTS,
+    include_depth=include_depth,
+    include_normals=include_normals,
+    device=device
+  )
 
   infuse_args(model)
   raw_yolo_architecture = model.yolo_backbone
@@ -175,21 +170,9 @@ def get_model(model_type: AblationStudyType):
 spatial_aug, photometric_aug = get_augmentation_pipeline()
 
 def get_dataset_and_loader(model_type: AblationStudyType):
-  if model_type == 'vanilla':
-    include_depth = False
-    include_normals = False
-  elif model_type == 'additional-depth':
-    include_depth = True
-    include_normals = False
-  elif model_type == 'additional-normal':
-    include_depth = False
-    include_normals = True
-  elif model_type == 'additional-both':
-    include_depth = True
-    include_normals = True
+  include_depth, include_normals = TASK_CONFIG[model_type]
 
-  from torch.utils.data.dataset import Subset
-  train_dataset = RescueNetDataset(
+  full_train_dataset = RescueNetDataset(
     data_dir='data/RescueNet/train',
     include_depth=include_depth,
     include_normals=include_normals,
@@ -197,25 +180,25 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     photometric_transform=photometric_aug,
     training=True
   )
-  subset_size = len(train_dataset) // 4
-  indices = rng.choice(len(train_dataset), size=subset_size, replace=False)
-  train_dataset = Subset(train_dataset, indices)
-  class_pixel_counts = np.zeros(12)
-  for idx in indices:
-      label_path = train_dataset.dataset.label_paths[idx]  # .dataset since it's wrapped in Subset
-      label = np.load(label_path).squeeze()
-      for c in range(12):
-          class_pixel_counts[c] += (label == c).sum()
+  subset_size = len(full_train_dataset) // TRAIN_SUBSET_FRACTION
+  indices = rng.choice(len(full_train_dataset), size=subset_size, replace=False)
+  train_dataset = Subset(full_train_dataset, indices)
 
+  # Class pixel distribution of the sampled subset (sanity check vs CLASS_WEIGHTS)
+  class_pixel_counts = np.zeros(NUM_CLASSES)
+  for idx in indices:
+    label = np.load(full_train_dataset.label_paths[idx]).squeeze()
+    class_pixel_counts += np.bincount(label.ravel(), minlength=NUM_CLASSES)[:NUM_CLASSES]
   print(class_pixel_counts)
+
   val_dataset = RescueNetDataset(
     data_dir='data/RescueNet/val',
     include_depth=include_depth,
     include_normals=include_normals
   )
-  val_dataset = Subset(val_dataset, list(range(128)))
+  val_dataset = Subset(val_dataset, list(range(VAL_SUBSET_SIZE)))
 
-  train_loader = torch.utils.data.DataLoader(
+  train_loader = DataLoader(
     train_dataset,
     batch_size=TRAIN_BATCH_SIZE,
     shuffle=True,
@@ -225,8 +208,8 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     # pin_memory=True,
     # prefetch_factor=2
   )
-  
-  val_loader = torch.utils.data.DataLoader(
+
+  val_loader = DataLoader(
     val_dataset,
     batch_size=VAL_BATCH_SIZE,
     shuffle=False,
@@ -242,21 +225,8 @@ def get_dataset_and_loader(model_type: AblationStudyType):
     'val': (val_dataset, val_loader),
   }
 
-def get_depth_and_normals_inclusion(model_type: AblationStudyType) -> tuple[bool, bool]:
-  if model_type == 'vanilla':
-    return False, False
-  elif model_type == 'additional-depth':
-    return True, False
-  elif model_type == 'additional-normal':
-    return False, True
-  elif model_type == 'additional-both':
-    return True, True
-
-TOTAL_EPOCHS = 5
-TOTAL_STATIC_STEPS = 3
-TOTAL_WARMUP_STEPS = 2
-
 print('Start training - ablation study')
+
 for model_type in [
   # 'vanilla',
   'additional-both',
@@ -265,15 +235,18 @@ for model_type in [
 ]:
   dataset_and_loader = get_dataset_and_loader(model_type)
   raw_yolo_architecture, final_model, loss_balancer = get_model(model_type)  
-  include_depth, include_normals = get_depth_and_normals_inclusion(model_type)
+  include_depth, include_normals = TASK_CONFIG[model_type]
 
   trainable_params = [p for p in final_model.parameters() if p.requires_grad]
   trainable_params.extend(loss_balancer.parameters())
 
+  model_params = [p for p in final_model.parameters() if p.requires_grad]
   optimizer = AdamW(
-    trainable_params,
+    [
+      {'params': model_params, 'weight_decay': 5e-2},
+      {'params': list(loss_balancer.parameters()), 'weight_decay': 0.0},
+    ],
     lr=2e-4,
-    weight_decay=5e-2
   )
   
   warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -286,7 +259,7 @@ for model_type in [
   )
   cosine_annealing_scheduler = CosineAnnealingLR(
     optimizer,
-    T_max=TOTAL_EPOCHS - TOTAL_WARMUP_STEPS - TOTAL_STATIC_STEPS,
+    T_max=max(1, TOTAL_EPOCHS - TOTAL_WARMUP_STEPS - TOTAL_STATIC_STEPS),
     eta_min=1e-6
   )
   scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -318,7 +291,6 @@ for model_type in [
     epoch_weighted_train_normal_loss = torch.zeros((), device=device)
 
     set_training_mode(final_model, True)
-    final_model.yolo_backbone.train()
     
     for batch_idx, (batch_images, batch_targets) in enumerate(train_loader, 1):
       optimizer.zero_grad(set_to_none=True)
@@ -460,7 +432,7 @@ for model_type in [
 
     # Early Stopping evaluated ONCE per epoch using the average validation loss
     halt = early_stopping.record_and_check_if_halt(
-      avg_val_loss,
+      avg_val_seg_loss,
       final_model.state_dict(),
       loss_balancer.state_dict()
     )
@@ -542,14 +514,18 @@ for model_type in [
   # )
   
   # Cleanup
-  del final_model, loss_balancer, optimizer, scheduler, train_loader, val_loader, dataset_and_loader
-
-  unreachable_object = gc.collect()
-
   if torch.cuda.is_available():
     alloc_before = torch.cuda.memory_allocated() / (1024 ** 3)
     res_before = torch.cuda.memory_reserved() / (1024 ** 3)
 
+  del (
+    final_model, raw_yolo_architecture, loss_balancer,
+    seg_loss_criterion, depth_loss_criterion, early_stopping,
+    optimizer, scheduler, train_loader, val_loader, dataset_and_loader,
+  )
+  gc.collect()
+
+  if torch.cuda.is_available():
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
@@ -562,5 +538,6 @@ for model_type in [
     print("✅ PyTorch CUDA cache successfully flushed!")
   else:
     print("⚠️ CUDA not detected. Only system RAM was flushed.")
+
 
 # end_session()
