@@ -1,8 +1,9 @@
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Literal
 from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 
 import torch
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import cv2
 
 from custom_types.datasets import YOLOSegmentationTypedDict
@@ -113,11 +114,61 @@ class CameraIntrinsics(BaseModel):
     v = self.fy * y / z + self.cy
     return u, v
 
-def init_sda_sne(depth_map: np.ndarray) -> np.ndarray:
-  return np.array()
+def shift_matrix(original_matrix: np.ndarray, shift: int, axis: int) -> np.ndarray:
+  shifted_matrix = np.roll(original_matrix, shift=shift, axis=axis)
+  
+  # Shifting Rows (Up/Down)
+  if axis == 0:
+    if shift > 0:
+      shifted_matrix[:shift, :] = np.inf
+    elif shift < 0:
+      shifted_matrix[shift:, :] = np.inf
+  # Shifting Columns (Left/Right)
+  elif axis == 1:
+    if shift > 0:
+      shifted_matrix[:, :shift] = np.inf
+    elif shift < 0:
+      shifted_matrix[:, shift:] = np.inf
+          
+  return shifted_matrix
 
+def select_eta(second_d: np.ndarray, mode: Literal["u", "v"]) -> np.ndarray:
+  padding_width = ((0, 0), (1, 1)) if mode == "u" else ((1, 1), (0, 0))
+  padded = np.pad(second_d, padding_width, constant_values=np.inf)
+  
+  window = sliding_window_view(padded, 3, axis=1 if mode == "u" else 0)
+  window = window[..., [1, 0, 2]]
+  
+  eta = np.array([0, -1, 1])[np.argmin(window, axis=-1)]
+  
+  return eta
+  
 def sda_sne(depth_map: np.ndarray, camera_intrinsics: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray]:
-  dz_du, dz_dv = depth_map.copy(), depth_map.copy()
+  # Initialization Phase
+  
+  first_dufw_shifted = shift_matrix(depth_map, shift=-1, axis=1)
+  first_dubw_shifted = shift_matrix(depth_map, shift=+1, axis=1)
+  first_dvfw_shifted = shift_matrix(depth_map, shift=-1, axis=0)
+  first_dvbw_shifted = shift_matrix(depth_map, shift=+1, axis=0)
+  
+  first_dufw = first_dufw_shifted - depth_map
+  first_dubw = depth_map - first_dubw_shifted
+  first_dvfw = first_dvfw_shifted - depth_map
+  first_dvbw = depth_map - first_dvbw_shifted
+  second_du = first_dufw_shifted - 2 * depth_map + first_dubw_shifted
+  second_dv = first_dvfw_shifted - 2 * depth_map + first_dvbw_shifted
+  
+  eta_smoothing_u = select_eta(second_du, "u")
+  eta_smoothing_v = select_eta(second_dv, "v")
+  
+  z_u = np.select([eta_smoothing_u == 1, eta_smoothing_u == -1],
+                  [first_dufw, first_dubw],
+                  default=0.5 * (first_dufw + first_dubw))
+  z_v = np.select([eta_smoothing_v == 1, eta_smoothing_v == -1],
+                  [first_dvfw, first_dvbw],
+                  default=0.5 * (first_dvfw + first_dvbw))
+  
+  # Iteration Phase
   
   return dz_du, dz_dv
 
