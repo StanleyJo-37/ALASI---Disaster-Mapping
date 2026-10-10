@@ -132,20 +132,47 @@ def shift_matrix(original_matrix: np.ndarray, shift: int, axis: int) -> np.ndarr
           
   return shifted_matrix
 
-def select_eta(second_d: np.ndarray, mode: Literal["u", "v"]) -> np.ndarray:
+def initialize_eta_and_energy(second_d: np.ndarray, mode: Literal["u", "v"]) -> np.ndarray:
   padding_width = ((0, 0), (1, 1)) if mode == "u" else ((1, 1), (0, 0))
-  padded = np.pad(second_d, padding_width, constant_values=np.inf)
+  padded = np.pad(np.abs(second_d), padding_width, constant_values=np.inf)
   
   window = sliding_window_view(padded, 3, axis=1 if mode == "u" else 0)
   window = window[..., [1, 0, 2]]
   
-  eta = np.array([0, -1, 1])[np.argmin(window, axis=-1)]
+  state = np.array([0, -1, 1], dtype=np.int8)[np.argmin(window, axis=-1)]
+  energy = window.min(axis=-1)
   
-  return eta
+  return state, energy
   
-def sda_sne(depth_map: np.ndarray, camera_intrinsics: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray]:
+def select_state(omega: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+  OFFSETS = np.array([(0,0), (-1,0), (1,0), (0,-1), (0,1), (-1,-1), (1,-1), (-1,1), (1,1)])  # [du, dv]
+  
+  best = omega.argmin(axis=-1)
+  state = OFFSETS[best]
+  energy = np.take_along_axis(omega, best[..., None], axis=-1)[..., 0]
+  return state, energy
+  
+def nb(a, du, dv, fill=np.inf):
+  H, W = a.shape
+  out = np.full(a.shape, fill, dtype=a.dtype)
+  out[max(-dv,0):H-max(dv,0), max(-du,0):W-max(du,0)] = \
+      a[max(dv,0):H+min(dv,0), max(du,0):W+min(du,0)]
+  return out
+  
+def parallel_indicator(signed_pp, idx, k, du, dv):
+  same_here = idx == k
+  same_nb = nb(idx, du, dv, fill=-1) == k
+  c1 = nb(signed_pp, du, dv)
+  c2 = nb(signed_pp, 2*du, 2*dv)
+  c1 = np.where(np.isfinite(c1), c1, 0.0)
+  c2 = np.where(np.isfinite(c2), c2, 0.0)
+  ok = same_here & same_nb & (c1 * c2 > 0)
+  return np.where(ok, 0.0, np.inf)
+  
+def sda(depth_map: np.ndarray, camera_intrinsics: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray]:
+  H, W = depth_map.shape
+  
   # Initialization Phase
-  
   first_dufw_shifted = shift_matrix(depth_map, shift=-1, axis=1)
   first_dubw_shifted = shift_matrix(depth_map, shift=+1, axis=1)
   first_dvfw_shifted = shift_matrix(depth_map, shift=-1, axis=0)
@@ -158,19 +185,52 @@ def sda_sne(depth_map: np.ndarray, camera_intrinsics: CameraIntrinsics) -> tuple
   second_du = first_dufw_shifted - 2 * depth_map + first_dubw_shifted
   second_dv = first_dvfw_shifted - 2 * depth_map + first_dvbw_shifted
   
-  eta_smoothing_u = select_eta(second_du, "u")
-  eta_smoothing_v = select_eta(second_dv, "v")
+  eta_u, E_u = initialize_eta_and_energy(second_du, "u")
+  eta_v, E_v = initialize_eta_and_energy(second_dv, "v")
   
-  z_u = np.select([eta_smoothing_u == 1, eta_smoothing_u == -1],
+  s_u = np.zeros((H, W, 2), dtype=np.int8); s_u[..., 0] = eta_u   # [du, dv]
+  s_v = np.zeros((H, W, 2), dtype=np.int8); s_v[..., 1] = eta_v
+  
+  z_u = np.select([s_u == 1, s_u == -1],
                   [first_dufw, first_dubw],
                   default=0.5 * (first_dufw + first_dubw))
-  z_v = np.select([eta_smoothing_v == 1, eta_smoothing_v == -1],
+  z_v = np.select([s_v == 1, s_v == -1],
                   [first_dvfw, first_dvbw],
                   default=0.5 * (first_dvfw + first_dvbw))
   
   # Iteration Phase
+  MAX_ITER = 1e10
+  for i in range(1, MAX_ITER+1):
+    prev_s_u = s_u
+    prev_s_v = s_v
+    
+    a_uu, a_vv = np.abs(second_du), np.abs(second_dv)
+    W_auu, W_avv = window(a_uu), window(a_vv)
+    W_Eu, W_Ev = window(E_u), window(E_v)
+    
+    candidate_u = np.stack([
+      # Left (Parallel)
+      np.abs(second_du) + parallel_indicator(second_du, s_u, idx_u, 1, -1, 0),
+      # Right (Parallel)
+      np.abs(second_du) + parallel_indicator(second_du, s_u, idx_u, 2,  1, 0),
+      # Own energy
+      E_u,
+      # Down (Orthogonal)
+      2 * at(W_avv, 0, -1) + at(W_Eu, 0, -1),
+      # Up (Orthogonal)
+      2 * at(W_avv, 0,  1) + at(W_Eu, 0,  1),
+      # Up Right Corner (Diagonal)
+      
+    ], axis=0)
+    candidate_v = np.min(candidate_v, axis=0)
+    
+    s_u = np.argmin()
+    s_v = np.argmin()
+    
+    z_u = np.stack(E_u)
+    z_v = np.stack(E_v)
   
-  return dz_du, dz_dv
+  return z_u, z_v
 
 def compute_nz(
   x: np.ndarray,
@@ -198,7 +258,7 @@ def generate_surface_normals(
     Compute the depth gradients of the whole image
     - Shape = (width, height)
   """
-  dz_du, dz_dv = sda_sne(depth_map, camera_intrinsics)
+  dz_du, dz_dv = sda(depth_map, camera_intrinsics)
   inv_dz_du, inv_dz_dv = -dz_du ** 2, - dz_dv ** 2
   
   """
