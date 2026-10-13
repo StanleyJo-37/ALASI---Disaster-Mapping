@@ -1,12 +1,18 @@
-from typing import List, Tuple, Literal
+from typing import TypeAlias, List, Tuple, Literal, Optional, Dict
 from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
+import warnings
+import re
 
+from PIL import ImageFile
+import xml.etree.ElementTree as ET
 import torch
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 import cv2
 
-from custom_types.datasets import YOLOSegmentationTypedDict
+from ..custom_types.datasets import YOLOSegmentationTypedDict
+
+AxisType: TypeAlias = Literal["u", "v"]
 
 def convert_png_to_yolo_label(label: np.ndarray) -> YOLOSegmentationTypedDict:
   yolo_annotations = {
@@ -114,6 +120,55 @@ class CameraIntrinsics(BaseModel):
     v = self.fy * y / z + self.cy
     return u, v
 
+def get_camera_intrinsics(img: ImageFile.ImageFile) -> CameraIntrinsics:
+  DEFAULT_FX = 3051.613037
+  DEFAULT_FY = 3051.613037
+  DEFAULT_CX = 2500
+  DEFAULT_CY = 2500
+  
+  focal_length_regex = r'drone-dji:CalibratedFocalLength="([\d.]+)"'
+  center_x_regex = r'drone-dji:CalibratedOpticalCenterX="([\d.]+)"'
+  center_y_regex = r'drone-dji:CalibratedOpticalCenterY="([\d.]+)"'
+
+  xmp_data = img.info.get("xmp")
+  width, height = img.size
+  
+  if not xmp_data:
+    print("No XMP calibration data found in this image.")
+    return CameraIntrinsics(
+      fx=DEFAULT_FX,
+      fy=DEFAULT_FY,
+      cx=DEFAULT_CX,
+      cy=DEFAULT_CY,
+      width=width,
+      height=height
+    )
+
+  xmp_str = xmp_data.decode('utf-8', errors='ignore') if isinstance(xmp_data, bytes) else xmp_data
+  
+  focal_length = float(re.findall(focal_length_regex, xmp_str)[0])
+  center_x = float(re.findall(center_x_regex, xmp_str)[0])
+  center_y = float(re.findall(center_y_regex, xmp_str)[0])
+  
+  if np.isnan(focal_length) or np.isnan(center_x) or np.isnan(center_y):
+    return CameraIntrinsics(
+      fx=np.where(np.isnan(focal_length), DEFAULT_FX, focal_length),
+      fy=np.where(np.isnan(focal_length), DEFAULT_FY, focal_length),
+      cx=np.where(np.isnan(center_x), DEFAULT_CX, center_x),
+      cy=np.where(np.isnan(center_y), DEFAULT_CY, center_y),
+      width=width,
+      height=height
+    )
+  
+  return CameraIntrinsics(
+    fx=focal_length,
+    fy=focal_length,
+    cx=center_x,
+    cy=center_y,
+    width=width,
+    height=height
+  )
+
 def shift_matrix(original_matrix: np.ndarray, shift: int, axis: int) -> np.ndarray:
   shifted_matrix = np.roll(original_matrix, shift=shift, axis=axis)
   
@@ -132,7 +187,7 @@ def shift_matrix(original_matrix: np.ndarray, shift: int, axis: int) -> np.ndarr
           
   return shifted_matrix
 
-def initialize_eta_and_energy(second_d: np.ndarray, mode: Literal["u", "v"]) -> np.ndarray:
+def initialize_eta_and_energy(second_d: np.ndarray, mode: AxisType) -> np.ndarray:
   padding_width = ((0, 0), (1, 1)) if mode == "u" else ((1, 1), (0, 0))
   padded = np.pad(np.abs(second_d), padding_width, constant_values=np.inf)
   
@@ -144,32 +199,106 @@ def initialize_eta_and_energy(second_d: np.ndarray, mode: Literal["u", "v"]) -> 
   
   return state, energy
   
+OFFSETS = np.array([(0,0), (-1,0), (1,0), (0,-1), (0,1), (-1,-1), (1,-1), (-1,1), (1,1)])  # [du, dv]
 def select_state(omega: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-  OFFSETS = np.array([(0,0), (-1,0), (1,0), (0,-1), (0,1), (-1,-1), (1,-1), (-1,1), (1,1)])  # [du, dv]
-  
-  best = omega.argmin(axis=-1)
+  best = omega.argmin(axis=0)
   state = OFFSETS[best]
-  energy = np.take_along_axis(omega, best[..., None], axis=-1)[..., 0]
+  energy = np.take_along_axis(omega, best[None, ...], axis=0)[0]
   return state, energy
   
-def nb(a, du, dv, fill=np.inf):
+def nb(
+  a: np.ndarray,
+  du: np.ndarray,
+  dv: np.ndarray,
+  fill: np.any=np.inf
+):
   H, W = a.shape
   out = np.full(a.shape, fill, dtype=a.dtype)
   out[max(-dv,0):H-max(dv,0), max(-du,0):W-max(du,0)] = \
       a[max(dv,0):H+min(dv,0), max(du,0):W+min(du,0)]
   return out
   
-def parallel_indicator(signed_pp, idx, k, du, dv):
-  same_here = idx == k
-  same_nb = nb(idx, du, dv, fill=-1) == k
-  c1 = nb(signed_pp, du, dv)
-  c2 = nb(signed_pp, 2*du, 2*dv)
-  c1 = np.where(np.isfinite(c1), c1, 0.0)
-  c2 = np.where(np.isfinite(c2), c2, 0.0)
-  ok = same_here & same_nb & (c1 * c2 > 0)
-  return np.where(ok, 0.0, np.inf)
+INDICATOR_INDICES: Dict[AxisType, Dict[Literal[-1, 1], int]] = {
+  "u": {
+    -1: 0,
+    1: 1,
+  },
+  "v": {
+    -1: 2,
+    1: 3
+  }
+}
   
-def sda(depth_map: np.ndarray, camera_intrinsics: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray]:
+def build_omega(
+  E_p: np.ndarray,
+  E_o: np.ndarray,
+  a_pp: np.ndarray,
+  a_oo: np.ndarray,
+  channel: AxisType,
+  indicators: List[np.ndarray]
+):
+  cands = []
+  for du, dv in OFFSETS:
+    along, across = (du, dv) if channel == "u" else (dv, du)
+    
+    if along == 0 and across == 0:
+      c = E_p
+    elif along == 0:
+      c = 2 * (nb(a_oo, du, dv) + nb(E_p, du, dv))
+    elif across == 0:
+      c = nb(a_pp, du, dv) + indicators[INDICATOR_INDICES[channel][along]]
+    else:
+      odu, odv = (0, dv) if channel == "u" else (du, 0)
+      c = nb(a_oo, odu, odv) + nb(E_p, odu, odv) + nb(a_pp, du, dv) + nb(E_o, du, dv)
+    
+    cands.append(c)
+    
+  return np.stack(cands, axis=0)
+  
+def build_gradient_candidates(
+  z: np.ndarray,
+  G_p: np.ndarray,
+  G_o: np.ndarray,
+  channel: AxisType,
+  k: int
+):
+  cands = []
+  for du, dv in OFFSETS:
+    along, across = (du, dv) if channel == "u" else (dv, du)
+    if along == 0 and across == 0:
+      c = G_p
+    elif along == 0:
+      c = nb(G_p, du, dv)
+    elif across == 0:
+      c = G_p + along * ((nb(z, du, dv) - z) / (k + 1)) - (nb(G_p, du, dv) / (k + 1))
+    else:
+      odu, odv = (0, dv) if channel == "u" else (du, 0) 
+      c = nb(G_p, odu, odv) + du * dv * (G_o - nb(G_o, du, dv))
+    cands.append(c)
+  
+  return np.stack(cands, axis=0)
+  
+def build_indicator(
+  signed_pp: np.ndarray,
+  channel: AxisType,
+  d: int,
+  state: Optional[np.ndarray],
+):
+  du, dv = (d, 0) if channel == "u" else (0, d)
+  
+  signed_condition1 = np.where(np.isfinite(nb(signed_pp, du, dv)), nb(signed_pp, du, dv), 0)
+  signed_condition2 = np.where(np.isfinite(nb(signed_pp, du*2, dv*2)), nb(signed_pp, du*2, dv*2), 0)
+  signed_condition = ~(signed_condition1 * signed_condition2 > 0)
+  
+  states_directions = (state == np.array([du, dv])).all(axis=-1)
+  state_condition = ~(states_directions & nb(states_directions, du, dv, fill=False))
+  
+  ind_matrix = np.zeros(signed_pp.shape)
+  ind_matrix[signed_condition | state_condition] = np.inf
+  
+  return ind_matrix
+
+def sda(depth_map: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
   H, W = depth_map.shape
   
   # Initialization Phase
@@ -184,51 +313,52 @@ def sda(depth_map: np.ndarray, camera_intrinsics: CameraIntrinsics) -> tuple[np.
   first_dvbw = depth_map - first_dvbw_shifted
   second_du = first_dufw_shifted - 2 * depth_map + first_dubw_shifted
   second_dv = first_dvfw_shifted - 2 * depth_map + first_dvbw_shifted
+  a_uu, a_vv = np.abs(second_du), np.abs(second_dv)
   
   eta_u, E_u = initialize_eta_and_energy(second_du, "u")
   eta_v, E_v = initialize_eta_and_energy(second_dv, "v")
   
-  s_u = np.zeros((H, W, 2), dtype=np.int8); s_u[..., 0] = eta_u   # [du, dv]
+  s_u = np.zeros((H, W, 2), dtype=np.int8); s_u[..., 0] = eta_u
   s_v = np.zeros((H, W, 2), dtype=np.int8); s_v[..., 1] = eta_v
   
-  z_u = np.select([s_u == 1, s_u == -1],
-                  [first_dufw, first_dubw],
-                  default=0.5 * (first_dufw + first_dubw))
-  z_v = np.select([s_v == 1, s_v == -1],
-                  [first_dvfw, first_dvbw],
-                  default=0.5 * (first_dvfw + first_dvbw))
+  indicators = [
+    build_indicator(second_du, "u", -1, s_u),
+    build_indicator(second_du, "u",  1, s_u),
+    build_indicator(second_dv, "v", -1, s_v),
+    build_indicator(second_dv, "v",  1, s_v)
+  ]
+  
+  with np.errstate(invalid="ignore"):
+    z_u = np.select([eta_u == 1, eta_u == -1],
+                    [first_dufw, first_dubw],
+                    default=0.5 * (first_dufw + first_dubw))
+    z_v = np.select([eta_v == 1, eta_v == -1],
+                    [first_dvfw, first_dvbw],
+                    default=0.5 * (first_dvfw + first_dvbw))
   
   # Iteration Phase
-  MAX_ITER = 1e10
-  for i in range(1, MAX_ITER+1):
-    prev_s_u = s_u
-    prev_s_v = s_v
+  MAX_ITER = int(100)
+  for k in range(1, MAX_ITER+1):    
+    candidate_u = build_omega(E_u, E_v, a_uu, a_vv, "u", indicators)
+    candidate_v = build_omega(E_v, E_u, a_vv, a_uu, "v", indicators)
     
-    a_uu, a_vv = np.abs(second_du), np.abs(second_dv)
-    W_auu, W_avv = window(a_uu), window(a_vv)
-    W_Eu, W_Ev = window(E_u), window(E_v)
+    s_u, E_u = select_state(candidate_u)
+    s_v, E_v = select_state(candidate_v)
     
-    candidate_u = np.stack([
-      # Left (Parallel)
-      np.abs(second_du) + parallel_indicator(second_du, s_u, idx_u, 1, -1, 0),
-      # Right (Parallel)
-      np.abs(second_du) + parallel_indicator(second_du, s_u, idx_u, 2,  1, 0),
-      # Own energy
-      E_u,
-      # Down (Orthogonal)
-      2 * at(W_avv, 0, -1) + at(W_Eu, 0, -1),
-      # Up (Orthogonal)
-      2 * at(W_avv, 0,  1) + at(W_Eu, 0,  1),
-      # Up Right Corner (Diagonal)
-      
-    ], axis=0)
-    candidate_v = np.min(candidate_v, axis=0)
+    indicators = [
+      build_indicator(second_du, "u", -1, s_u),
+      build_indicator(second_du, "u",  1, s_u),
+      build_indicator(second_dv, "v", -1, s_v),
+      build_indicator(second_dv, "v",  1, s_v)
+    ]
     
-    s_u = np.argmin()
-    s_v = np.argmin()
+    if not s_u.any() and not s_v.any():
+      break
     
-    z_u = np.stack(E_u)
-    z_v = np.stack(E_v)
+    z_u_cand = build_gradient_candidates(depth_map, z_u, z_v, "u", k)
+    z_v_cand = build_gradient_candidates(depth_map, z_v, z_u, "v", k)
+    z_u = np.select([(s_u == OFFSETS[m]).all(axis=-1) for m in range(9)], list(z_u_cand))
+    z_v = np.select([(s_v == OFFSETS[m]).all(axis=-1) for m in range(9)], list(z_v_cand))
   
   return z_u, z_v
 
@@ -237,12 +367,31 @@ def compute_nz(
   y: np.ndarray,
   z: np.ndarray,
   n_x: np.ndarray,
-  n_z: np.ndarray,
-  window_size: int
+  n_y: np.ndarray,
+  window_size: int,
+  use_median: bool
 ) -> np.ndarray:
-  n_z = np.array()
+  r = window_size // 2
+  H, W = z.shape
   
-  return n_z
+  def windows(m):
+    padded_m = np.pad(m, ((r, r), (r, r)), constant_values=np.nan)
+    return sliding_window_view(padded_m, (window_size, window_size), axis=(0, 1))
+  
+  dx = windows(x) - x[..., None, None]
+  dy = windows(y) - y[..., None, None]
+  dz = windows(z) - z[..., None, None]
+  dz = np.where(dz == 0, np.nan, dz)
+  
+  candidates = (dx * n_x[..., None, None] + dy * n_y[..., None, None]) / dz
+  candidates = candidates.reshape(H, W, -1)
+  
+  reduce = np.nanmedian if use_median else np.nanmean
+  with warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)
+    phi = reduce(candidates, axis=-1)
+
+  return -phi
 
 def generate_surface_normals(
   depth_map: np.ndarray,
@@ -258,8 +407,7 @@ def generate_surface_normals(
     Compute the depth gradients of the whole image
     - Shape = (width, height)
   """
-  dz_du, dz_dv = sda(depth_map, camera_intrinsics)
-  inv_dz_du, inv_dz_dv = -dz_du ** 2, - dz_dv ** 2
+  d_invz_du, d_invz_dv = sda(1 / depth_map)
   
   """
     Compute the normal components
@@ -267,13 +415,13 @@ def generate_surface_normals(
     - n_y = intrinsics y * inverse depth graident in respect to v - Shape = (width, height).
     - n_z (follows the compute function)
   """
-  n_x = camera_intrinsics.fx * inv_dz_du
-  n_y = camera_intrinsics.fy * inv_dz_dv
-  n_z = compute_nz(x, y, z, n_y, n_z, window_size)
+  n_x = camera_intrinsics.fx * d_invz_du
+  n_y = camera_intrinsics.fy * d_invz_dv
+  n_z = compute_nz(x, y, z, n_x, n_y, window_size=window_size, use_median=True)
   
   surface_normals = np.stack([n_x, n_y, n_z], axis=-1)
-  surface_normals /= np.max(np.linalg.norm(surface_normals, axis=-1, keepdims=True), 1e-12)
+  surface_normals /= np.maximum(np.linalg.norm(surface_normals, axis=-1, keepdims=True), 1e-12)
   
   p = np.stack([x, y, z], axis=-1)
-  surface_normals[(surface_normals * p).sum(-1) > 0] *= -1                               # face the camera
+  surface_normals[(surface_normals * p).sum(-1) > 0] *= -1
   return surface_normals
