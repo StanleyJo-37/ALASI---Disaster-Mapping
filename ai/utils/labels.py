@@ -122,7 +122,7 @@ class CameraIntrinsics(BaseModel):
     return u, v
   
   def to_horizontal_fov(self):
-    return 2 * math.atan(self.width / (2 & self.fx)) * (180 / math.pi)
+    return math.degrees(2 * math.atan(self.width / (2 * self.fx)))
   
   def __dict__(self):
     return {
