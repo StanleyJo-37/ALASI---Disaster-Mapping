@@ -2,6 +2,7 @@ from typing import TypeAlias, List, Tuple, Literal, Optional, Dict
 from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 import warnings
 import re
+import math
 
 from PIL import ImageFile
 import xml.etree.ElementTree as ET
@@ -10,7 +11,7 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 import cv2
 
-from ..custom_types.datasets import YOLOSegmentationTypedDict
+from custom_types.datasets import YOLOSegmentationTypedDict
 
 AxisType: TypeAlias = Literal["u", "v"]
 
@@ -119,6 +120,20 @@ class CameraIntrinsics(BaseModel):
     u = self.fx * x / z + self.cx
     v = self.fy * y / z + self.cy
     return u, v
+  
+  def to_horizontal_fov(self):
+    return 2 * math.atan(self.width / (2 & self.fx)) * (180 / math.pi)
+  
+  def __dict__(self):
+    return {
+      "fx": self.fx,
+      "fy": self.fy,
+      "cx": self.cx,
+      "cy": self.cy,
+      "width": self.width,
+      "height": self.height,
+      "fov": self.to_horizontal_fov()
+    }
 
 def get_camera_intrinsics(img: ImageFile.ImageFile) -> CameraIntrinsics:
   DEFAULT_FX = 3051.613037
